@@ -689,14 +689,14 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]))
 
 
-async def _edit_callback_message(q, text, reply_markup=None):
-    """Edit either a text message or the caption of a photo-based start screen."""
+async def _edit_callback_message(q, text, reply_markup=None, parse_mode="HTML"):
+    """Edit text messages or media captions safely from any callback screen."""
     if q.message and q.message.caption is not None:
         return await q.edit_message_caption(
-            caption=text, parse_mode="HTML", reply_markup=reply_markup
+            caption=text, parse_mode=parse_mode, reply_markup=reply_markup
         )
     return await q.edit_message_text(
-        text, parse_mode="HTML", reply_markup=reply_markup
+        text, parse_mode=parse_mode, reply_markup=reply_markup
     )
 
 
@@ -778,7 +778,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = [[InlineKeyboardButton(f"❌ Remove {m['_id']}", callback_data=f"adm_mgr_remove_{m['_id']}")] for m in managers]
         rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="adm_managers")])
         rows.append([InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="adm_back")])
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
 
     elif d.startswith("adm_mgr_remove_"):
         try:
@@ -790,7 +790,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not exists:
             await q.answer("Manager not found", show_alert=True)
             return
-        await q.edit_message_text(
+        await _edit_callback_message(q, 
             f"⚠️ <b>Remove AdminGG manager?</b>\n\nUser ID: <code>{uid}</code>\n\nThis user will lose upload and share-link access.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
@@ -813,7 +813,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "➕ Add manager: <code>/addmanager USER_ID</code>\n➖ Remove managers with the buttons below."
         rows = [[InlineKeyboardButton(f"❌ Remove {m['_id']}", callback_data=f"adm_mgr_remove_{m['_id']}")] for m in managers]
         rows += [[InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="adm_back")]]
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
 
     elif d == "adm_stats":
         text = (
@@ -823,7 +823,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔒 FSub: <b>{len(await db_get_fsub())}</b>\n"
             f"⏳ Auto Del: <b>{_fmt_del(await db_get_auto_del())}</b>"
         )
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=_back_btn())
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=_back_btn())
 
     elif d == "adm_mongo":
         try:
@@ -840,21 +840,21 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             text = f"🍃 <b>MongoDB Status</b>\n\n❌ <b>Error:</b>\n<code>{e}</code>"
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=_back_btn())
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=_back_btn())
 
     elif d == "adm_listfsub":
         channels = await db_get_fsub()
         text = "📋 <b>Force Sub Channels:</b>\n\n" if channels else "No force sub channels.\n\nUse /addfsub &lt;id1&gt; &lt;id2&gt; ..."
         for ch in channels:
             text += f"• <b>{ch.get('title','?')}</b>\n  <code>{ch['_id']}</code>\n\n"
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=_back_btn())
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=_back_btn())
 
     elif d == "adm_listmsgs":
         text = "📝 <b>Editable Keys:</b>\n\n"
         for key in DEFAULT_MESSAGES:
             text += f"<code>/setmsg {key} text</code>\n"
         text += "\n<b>Placeholders:</b> <code>{first}</code> <code>{auto_del}</code> <code>{file_name}</code> <code>{count}</code>"
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=_back_btn())
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=_back_btn())
 
     elif d == "adm_listfiles" or d.startswith("adm_listfiles_p"):
         page = int(d.split("_p")[1]) if "_p" in d else 0
@@ -863,7 +863,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = len(all_files)
         chunk = all_files[page * per_page:(page + 1) * per_page]
         if not chunk:
-            await q.edit_message_text("No files stored.", reply_markup=_back_btn())
+            await _edit_callback_message(q, "No files stored.", reply_markup=_back_btn())
             return
         text = f"📦 <b>Files</b> ({page * per_page + 1}–{min((page + 1) * per_page, total)} of {total})\n\n"
         text += "<i>🔗 = Get Link  🗑 = Delete</i>\n"
@@ -886,13 +886,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if nav:
             btns.append(nav)
         btns.append([InlineKeyboardButton("⬅️ Back", callback_data="adm_back")])
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
     elif d.startswith("adm_fileinfo_"):
         token = d[len("adm_fileinfo_"):]
         doc = await db_get_file(token)
         if not doc:
-            await q.edit_message_text("❌ File not found.", reply_markup=_back_btn())
+            await _edit_callback_message(q, "❌ File not found.", reply_markup=_back_btn())
             return
         link = f"https://t.me/{BOT_USERNAME}?start={token}"
         text = (
@@ -906,7 +906,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🗑 Delete File", callback_data=f"adm_qdel_{token}|0")],
             [InlineKeyboardButton("⬅️ Back to Files", callback_data="adm_listfiles")],
         ]
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
     elif d.startswith("adm_qdel_"):
         payload = d[len("adm_qdel_"):]
@@ -928,7 +928,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page = max(0, page - 1)
             chunk = all_files[page * per_page:(page + 1) * per_page]
         if not chunk:
-            await q.edit_message_text("No files stored.", reply_markup=_back_btn())
+            await _edit_callback_message(q, "No files stored.", reply_markup=_back_btn())
             return
         text = f"📦 <b>Files</b> ({page * per_page + 1}–{min((page + 1) * per_page, total)} of {total})\n\n<i>🔗 = Get Link  🗑 = Delete</i>\n"
         btns = []
@@ -950,10 +950,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if nav:
             btns.append(nav)
         btns.append([InlineKeyboardButton("⬅️ Back", callback_data="adm_back")])
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
     elif d == "adm_addfsub_help":
-        await q.edit_message_text(
+        await _edit_callback_message(q, 
             "➕ <b>Add Force Sub</b>\n\n"
             "1. Add bot as <b>admin</b> to channel\n"
             "2. Run (supports multiple):\n\n"
@@ -971,11 +971,11 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "➖ <b>Remove FSub — copy & run:</b>\n\n"
             for ch in channels:
                 text += f"<code>/removefsub {ch['_id']}</code> — {ch.get('title','?')}\n"
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=_back_btn())
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=_back_btn())
 
     elif d == "adm_autodel_help":
         s = await db_get_auto_del()
-        await q.edit_message_text(
+        await _edit_callback_message(q, 
             f"⏳ <b>Auto Delete</b>\n\nCurrent: <b>{_fmt_del(s)}</b> ({s}s)\n\n"
             f"<code>/setautodel 300</code> — 5m\n"
             f"<code>/setautodel 3600</code> — 1h\n"
@@ -984,7 +984,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif d == "adm_broadcast_help":
-        await q.edit_message_text(
+        await _edit_callback_message(q, 
             f"📡 <b>Broadcast</b>\n\n{await db_user_count()} users will receive it.\n\n"
             "<b>Text:</b> <code>/broadcast Your message</code>\n"
             "<b>Photo/video/document/audio:</b> send the media to this chat, reply to it with <code>/broadcast</code>.\n"
@@ -993,13 +993,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif d == "adm_ban_help":
-        await q.edit_message_text("🚫 <b>Ban</b>\n\n<code>/ban 123456789</code>", parse_mode="HTML", reply_markup=_back_btn())
+        await _edit_callback_message(q, "🚫 <b>Ban</b>\n\n<code>/ban 123456789</code>", parse_mode="HTML", reply_markup=_back_btn())
 
     elif d == "adm_unban_help":
-        await q.edit_message_text("✅ <b>Unban</b>\n\n<code>/unban 123456789</code>", parse_mode="HTML", reply_markup=_back_btn())
+        await _edit_callback_message(q, "✅ <b>Unban</b>\n\n<code>/unban 123456789</code>", parse_mode="HTML", reply_markup=_back_btn())
 
     elif d == "adm_delfile_help":
-        await q.edit_message_text(
+        await _edit_callback_message(q, 
             "🗑 <b>Delete File</b>\n\n<code>/delfile token</code>\n\nDeletes from channel + DB.",
             parse_mode="HTML", reply_markup=_back_btn()
         )
