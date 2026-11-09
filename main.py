@@ -723,15 +723,18 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fsub = await db_get_fsub()
     users = await db_user_count()
     files = await db_file_count()
+    manager_count = await managers_col.count_documents({})
     text = (
         f"👑 <b>{BOT_NAME} Control Center</b>\n"
         "<i>Manage your bot from one place.</i>\n\n"
         f"👥 <b>{users}</b> users     📦 <b>{files}</b> files\n"
-        f"🔒 <b>{len(fsub)}</b> force-sub channels     ⏳ <b>{_fmt_del(auto_del)}</b> auto-delete\n\n"
+        f"🔒 <b>{len(fsub)}</b> force-sub channels     ⏳ <b>{_fmt_del(auto_del)}</b> auto-delete\n"
+        f"🛠 <b>{manager_count}</b> AdminGG managers\n\n"
         "Select a management section:"
     )
     btns = [
         [InlineKeyboardButton("📊 Overview & Stats", callback_data="adm_stats")],
+        [InlineKeyboardButton("🛠 Manager Management (AdminGG)", callback_data="adm_managers")],
         [InlineKeyboardButton("🔒 Force Sub Channels", callback_data="adm_listfsub")],
         [InlineKeyboardButton("📝 Edit Messages", callback_data="adm_listmsgs"),
          InlineKeyboardButton("📦 List Files", callback_data="adm_listfiles")],
@@ -761,7 +764,58 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     d = q.data
 
-    if d == "adm_stats":
+    if d == "adm_managers":
+        managers = await managers_col.find({}, {"_id": 1}).to_list(None)
+        text = (
+            "🛠 <b>AdminGG Manager Management</b>\n\n"
+            f"👥 Total managers: <b>{len(managers)}</b>\n\n"
+            "AdminGG permissions: upload files and generate share links only. "
+            "They cannot access the owner dashboard or manage channels, users, broadcasts, or settings.\n\n"
+            "➕ Add manager: <code>/addmanager USER_ID</code>\n"
+            "➖ Remove manager: use the button below.\n"
+            "📋 List managers: <code>/listmanagers</code>"
+        )
+        rows = [[InlineKeyboardButton(f"❌ Remove {m['_id']}", callback_data=f"adm_mgr_remove_{m['_id']}")] for m in managers]
+        rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="adm_managers")])
+        rows.append([InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="adm_back")])
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif d.startswith("adm_mgr_remove_"):
+        try:
+            uid = int(d[len("adm_mgr_remove_"):])
+        except ValueError:
+            await q.answer("Invalid manager ID", show_alert=True)
+            return
+        exists = await managers_col.find_one({"_id": uid})
+        if not exists:
+            await q.answer("Manager not found", show_alert=True)
+            return
+        await q.edit_message_text(
+            f"⚠️ <b>Remove AdminGG manager?</b>\n\nUser ID: <code>{uid}</code>\n\nThis user will lose upload and share-link access.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm Remove", callback_data=f"adm_mgr_confirm_{uid}"),
+                 InlineKeyboardButton("❌ Cancel", callback_data="adm_managers")],
+                [InlineKeyboardButton("⬅️ Dashboard", callback_data="adm_back")],
+            ])
+        )
+
+    elif d.startswith("adm_mgr_confirm_"):
+        try:
+            uid = int(d[len("adm_mgr_confirm_"):])
+        except ValueError:
+            await q.answer("Invalid manager ID", show_alert=True)
+            return
+        result = await managers_col.delete_one({"_id": uid})
+        await q.answer("Manager removed" if result.deleted_count else "Manager not found")
+        managers = await managers_col.find({}, {"_id": 1}).to_list(None)
+        text = "🛠 <b>AdminGG Manager Management</b>\n\n" + (f"👥 Total managers: <b>{len(managers)}</b>\n\n" if managers else "No managers currently added.\n\n")
+        text += "➕ Add manager: <code>/addmanager USER_ID</code>\n➖ Remove managers with the buttons below."
+        rows = [[InlineKeyboardButton(f"❌ Remove {m['_id']}", callback_data=f"adm_mgr_remove_{m['_id']}")] for m in managers]
+        rows += [[InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="adm_back")]]
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif d == "adm_stats":
         text = (
             f"📊 <b>Stats</b>\n\n"
             f"👥 Users: <b>{await db_user_count()}</b>\n"
@@ -1036,6 +1090,39 @@ async def cmd_listmanagers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛠 <b>AdminGG Managers</b>\n\n" + "\n".join(lines), parse_mode="HTML")
 
 
+async def cmd_testfsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnose Force Subscribe channel access and bot admin status (owner only)."""
+    if not update.effective_user or not _is_admin(update.effective_user.id):
+        return
+    channels = await db_get_fsub()
+    if not channels:
+        await update.message.reply_text("No Force Subscribe channels are configured. Add one with /addfsub <channel_id>.")
+        return
+    me = await context.bot.get_me()
+    lines = ["🔎 <b>Force Subscribe Diagnostic</b>", f"Bot: @{me.username or me.id}", ""]
+    for ch in channels:
+        ch_id = ch.get("_id")
+        try:
+            chat = await context.bot.get_chat(ch_id)
+            bot_member = await context.bot.get_chat_member(chat_id=ch_id, user_id=me.id)
+            status = str(bot_member.status).lower()
+            admin_ok = status in ("administrator", "creator", "owner")
+            lines.append(
+                f"{'✅' if admin_ok else '⚠️'} <b>{chat.title or ch.get('title') or ch_id}</b> "
+                f"<code>{ch_id}</code>\nBot status: <code>{status}</code>\n"
+                + ("Membership checks should be available." if admin_ok else "Make the bot an administrator in this channel.")
+            )
+        except Exception as exc:
+            logging.exception("Force-sub diagnostic failed for channel %s", ch_id)
+            lines.append(
+                f"❌ <b>{ch.get('title') or ch_id}</b> <code>{ch_id}</code>\n"
+                f"Error: <code>{type(exc).__name__}: {str(exc)[:300]}</code>\n"
+                "Check the channel ID and make sure the bot is added as an administrator."
+            )
+        lines.append("")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_addfsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add force-sub channels. An invite URL may be supplied explicitly.
 
@@ -1294,6 +1381,7 @@ def main():
     app.add_handler(CommandHandler("removemanager", cmd_removemanager))
     app.add_handler(CommandHandler("listmanagers", cmd_listmanagers))
     app.add_handler(CommandHandler("mongo", cmd_mongo))
+    app.add_handler(CommandHandler("testfsub", cmd_testfsub))
     app.add_handler(CommandHandler("addfsub", cmd_addfsub))
     app.add_handler(CommandHandler("setfsublink", cmd_setfsublink))
     app.add_handler(CommandHandler("removefsub", cmd_removefsub))
