@@ -132,6 +132,8 @@ async def _start_runtime(doc):
         app.add_handler(CommandHandler("start", _bot_start))
         app.add_handler(CommandHandler("help", _bot_help))
         app.add_handler(CommandHandler("myaccount", cmd_bot_myaccount))
+        app.add_handler(CommandHandler("panel", cmd_bot_panel))
+        app.add_handler(CommandHandler("dashboard", cmd_bot_panel))
         app.add_handler(CommandHandler("addmanager", cmd_bot_addmanager))
         app.add_handler(CommandHandler("removemanager", cmd_bot_removemanager))
         app.add_handler(CommandHandler("listmanagers", cmd_bot_listmanagers))
@@ -145,6 +147,8 @@ async def _start_runtime(doc):
         app.add_handler(CommandHandler("broadcast", cmd_bot_broadcast))
         app.add_handler(CallbackQueryHandler(_bot_verify_callback, pattern=r"^netverify:"))
         app.add_handler(CallbackQueryHandler(_bot_account_callback, pattern=r"^netaccount$"))
+        app.add_handler(CallbackQueryHandler(_bot_panel_callback, pattern=r"^netpanel:"))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _bot_panel_text))
         app.add_handler(MessageHandler(
             filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO,
             _bot_upload,
@@ -159,21 +163,11 @@ async def _start_runtime(doc):
             await app.initialize()
             try:
                 from telegram import BotCommand
+                # Keep the public Telegram command menu minimal. Owner tools remain
+                # available through the private inline Control Center, not exposed
+                # as a long command list to ordinary bot users.
                 await app.bot.set_my_commands([
-                    BotCommand("start", "Open bot / receive a shared file"),
-                    BotCommand("help", "Show bot help and owner commands"),
-                    BotCommand("myaccount", "View your network account statistics"),
-                    BotCommand("addmanager", "Add a manager (owner only)"),
-                    BotCommand("removemanager", "Remove a manager (owner only)"),
-                    BotCommand("listmanagers", "List managers (owner only)"),
-                    BotCommand("addfjoin", "Add a force-join channel (owner only)"),
-                    BotCommand("listfjoin", "List force-join channels (owner only)"),
-                    BotCommand("removefjoin", "Remove your force-join channel (owner only)"),
-                    BotCommand("setwelcome", "Set welcome text (owner only)"),
-                    BotCommand("setchannel", "Set your channel button (owner only)"),
-                    BotCommand("broadcast", "Broadcast to users (owner only)"),
-                    BotCommand("ban", "Ban a user (owner only)"),
-                    BotCommand("unban", "Unban a user (owner only)"),
+                    BotCommand("start", "Start the bot / open shared files"),
                 ])
             except Exception:
                 log.warning("Could not set command menu for customer bot %s", bot_id)
@@ -261,6 +255,7 @@ async def _bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if doc.get("channel_url"):
         rows.append([InlineKeyboardButton(doc.get("channel_button") or "📢 My Channel", url=doc["channel_url"])])
     if user.id == int(doc["owner_id"]):
+        rows.append([InlineKeyboardButton("🎛 Control Center", callback_data="netpanel:home")])
         rows.append([InlineKeyboardButton("👤 My Account", callback_data="netaccount")])
     await update.effective_message.reply_text(welcome, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
 
@@ -270,29 +265,68 @@ async def _bot_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner = bool(doc and update.effective_user and update.effective_user.id == int(doc["owner_id"]))
     text = "Open a share link to receive a file. Only the bot owner and approved managers can upload files."
     if owner:
-        text += ("\n\nOwner commands:\n/addmanager USER_ID · /removemanager USER_ID · /listmanagers\n"
-                 "/ban USER_ID · /unban USER_ID\n/addfjoin CHANNEL_ID · /listfjoin · /removefjoin CHANNEL_ID\n"
-                 "/setwelcome TEXT · /setchannel URL [Button text] · /broadcast TEXT · /myaccount")
+        text += "\n\nUse the 🎛 Control Center button in /start to manage your bot."
     await update.effective_message.reply_text(text)
 
 
 async def _all_required_channels(doc):
+    """Return platform-required and bot-owner channels, de-duplicated by chat ID."""
     own = await owner_fsub_col.find({"bot_id": int(doc["_id"])}).to_list(None)
     global_channels = await global_fsub_col.find().to_list(None)
-    # Global channels are platform-mandated and always apply, even when owners add none.
-    return global_channels + own
+    # Platform channels are mandatory for every member bot, even if its owner
+    # has not configured any personal Force Join channels.
+    result, seen = [], set()
+    for raw in global_channels + own:
+        try:
+            ch_id = int(raw.get("_id", raw.get("chat_id")))
+        except (TypeError, ValueError):
+            # Keep malformed configured entries so the check fails closed below.
+            result.append(raw)
+            continue
+        if ch_id in seen:
+            continue
+        seen.add(ch_id)
+        ch = dict(raw)
+        ch["_id"] = ch_id
+        result.append(ch)
+    return result
+
+
+def _member_status_value(member):
+    """Normalize PTB status values without relying on Enum string formatting."""
+    value = getattr(member, "status", None)
+    value = getattr(value, "value", value)
+    if value is None:
+        return ""
+    value = str(value).lower()
+    return value.rsplit(".", 1)[-1]
 
 
 async def _check_membership(user_id, doc):
+    """Fail closed: a file is released only when every required channel is verified."""
     not_joined, errors = [], []
     for ch in await _all_required_channels(doc):
+        ch_id = ch.get("_id")
         try:
-            member = await _main_bot.get_chat_member(chat_id=ch["_id"], user_id=user_id)
-            status = str(member.status).lower()
-            if status in ("left", "kicked") or (status == "restricted" and getattr(member, "is_member", False) is False):
+            if ch_id is None:
+                raise ValueError("Configured Force Join entry has no channel ID")
+            member = await _main_bot.get_chat_member(chat_id=int(ch_id), user_id=int(user_id))
+            status = _member_status_value(member)
+            # Only explicit Telegram membership states count as joined. Unknown
+            # states are verification errors, never an accidental pass.
+            if status in ("creator", "administrator", "member"):
+                continue
+            if status == "restricted":
+                if bool(getattr(member, "is_member", False)):
+                    continue
                 not_joined.append(ch)
+                continue
+            if status in ("left", "kicked"):
+                not_joined.append(ch)
+                continue
+            raise ValueError(f"Unexpected Telegram membership status: {status or 'empty'}")
         except Exception as exc:
-            log.warning("Network FSub check failed for %s: %s", ch.get("_id"), exc)
+            log.warning("Network FSub check failed for channel %s: %s", ch_id, exc)
             errors.append(ch)
     return not_joined, errors
 
@@ -301,10 +335,17 @@ async def _send_gate(update, doc, token, channels, error=False):
     rows = []
     for ch in channels:
         url = ch.get("invite_link")
-        if url:
-            rows.append([InlineKeyboardButton(f"📢 Join {ch.get('title', 'Channel')[:45]}", url=url)])
-    rows.append([InlineKeyboardButton("✅ I've Joined — Verify", callback_data=f"netverify:{token}")])
-    text = "⚠️ Membership verification is temporarily unavailable. Please try later." if error else "🔒 Join all required channels, then tap Verify Membership."
+        title = str(ch.get("title") or "Required channel")
+        if url and str(url).startswith(("https://t.me/", "http://t.me/")):
+            rows.append([InlineKeyboardButton(f"📢 Join {title[:45]}", url=url)])
+    rows.append([InlineKeyboardButton("🔄 I've Joined — Verify Again", callback_data=f"netverify:{token}")])
+    if error:
+        text = (
+            "⚠️ I couldn't verify membership in every required channel. "
+            "File delivery is paused for your safety. Please try again later or contact the bot owner."
+        )
+    else:
+        text = "🔒 Join every required channel below, then tap Verify Again to receive the file."
     await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -347,6 +388,10 @@ async def _serve_file(update, context, token, doc):
 
 
 async def _bot_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # In panel media-broadcast mode, media is copied to users rather than stored as a file.
+    if context.user_data.get("netpanel_action") == "broadcast_media":
+        await _bot_panel_broadcast_media(update, context)
+        return
     doc = await _lookup_bot(context)
     if not doc or doc.get("status") != "running":
         return
@@ -543,6 +588,218 @@ async def cmd_bot_myaccount(update, context):
         f"📦 Files: <b>{files}</b>\n👥 Users: <b>{users}</b>\n📥 Downloads: <b>{downloads[0]['n'] if downloads else 0}</b>\n"
         f"🤖 Bots: <b>{len(bot_ids)}</b>\n🛠 Managers: <b>{managers}</b>", parse_mode="HTML")
 
+def _panel_home_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 My Account", callback_data="netpanel:account"), InlineKeyboardButton("📁 Files", callback_data="netpanel:files")],
+        [InlineKeyboardButton("👥 Users", callback_data="netpanel:users"), InlineKeyboardButton("🛠 Managers", callback_data="netpanel:managers")],
+        [InlineKeyboardButton("🔒 Force Join", callback_data="netpanel:fjoin"), InlineKeyboardButton("✏️ Welcome", callback_data="netpanel:welcome")],
+        [InlineKeyboardButton("📢 My Channel", callback_data="netpanel:channel"), InlineKeyboardButton("📡 Broadcast", callback_data="netpanel:broadcast")],
+    ])
+
+
+async def cmd_bot_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = await _lookup_bot(context)
+    if not doc or not update.effective_user or update.effective_user.id != int(doc["owner_id"]):
+        await update.effective_message.reply_text("This control center is available only to this bot's owner.")
+        return
+    context.user_data.pop("netpanel_action", None)
+    await update.effective_message.reply_text(
+        f"🎛 <b>Owner Control Center</b>\nManage @{context.bot.username} using the buttons below.",
+        reply_markup=_panel_home_markup(), parse_mode="HTML",
+    )
+
+
+async def _panel_account_text(context, doc):
+    bot_id = int(context.bot.id)
+    users = await users_col.count_documents({"bot_id": bot_id})
+    files = await files_col.count_documents({"bot_id": bot_id, "owner_id": int(doc["owner_id"])})
+    managers = await bot_managers_col.count_documents({"bot_id": bot_id})
+    agg = await users_col.aggregate([
+        {"$match": {"bot_id": bot_id}},
+        {"$group": {"_id": None, "n": {"$sum": {"$ifNull": ["$downloads", 0]}}}},
+    ]).to_list(1)
+    return (f"📊 <b>Bot Account — @{context.bot.username}</b>\n\n"
+            f"📦 Files: <b>{files}</b>\n👥 Users: <b>{users}</b>\n"
+            f"📥 Downloads: <b>{agg[0]['n'] if agg else 0}</b>\n🛠 Managers: <b>{managers}</b>")
+
+
+async def _bot_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    doc = await _lookup_bot(context)
+    if not doc or q.from_user.id != int(doc["owner_id"]):
+        return
+    data = q.data.split(":")
+    action = data[1] if len(data) > 1 else "home"
+    bot_id = int(context.bot.id)
+    context.user_data.pop("netpanel_action", None)
+
+    if action == "home":
+        await q.edit_message_text(f"🎛 <b>Owner Control Center</b>\n@{context.bot.username}", reply_markup=_panel_home_markup(), parse_mode="HTML")
+    elif action == "account":
+        await q.edit_message_text(await _panel_account_text(context, doc), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]]))
+    elif action == "files":
+        items = await files_col.find({"bot_id": bot_id, "owner_id": int(doc["owner_id"])}).sort("created_at", -1).limit(10).to_list(10)
+        rows = []
+        for item in items:
+            label = (item.get("file_name") or "File")[:28]
+            rows.append([InlineKeyboardButton(f"🗑 {label}", callback_data=f"netpanel:filedel:{item['_id']}")])
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")])
+        body = "📁 <b>Recent files</b>\nTap a file to delete it. Showing up to 10 newest files."
+        if not items: body += "\n\nNo files uploaded yet."
+        await q.edit_message_text(body, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "filedel" and len(data) == 3:
+        token = data[2]
+        item = await files_col.find_one({"_id": token, "bot_id": bot_id, "owner_id": int(doc["owner_id"])})
+        if item:
+            try: await _main_bot.delete_message(STORAGE_CHANNEL_ID, int(item["storage_message_id"]))
+            except Exception: log.warning("Could not delete storage message for network file %s", token)
+            await files_col.delete_one({"_id": token, "bot_id": bot_id, "owner_id": int(doc["owner_id"])})
+        items = await files_col.find({"bot_id": bot_id, "owner_id": int(doc["owner_id"])}).sort("created_at", -1).limit(10).to_list(10)
+        rows = [[InlineKeyboardButton(f"🗑 {(x.get('file_name') or 'File')[:28]}", callback_data=f"netpanel:filedel:{x['_id']}")] for x in items]
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")])
+        await q.edit_message_text("✅ File deleted." if item else "File was not found.", reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "users":
+        items = await users_col.find({"bot_id": bot_id}).sort("last_seen", -1).limit(10).to_list(10)
+        rows = []
+        for item in items:
+            uid = int(item["user_id"])
+            banned = bool(await bot_bans_col.find_one({"bot_id": bot_id, "user_id": uid}))
+            name = (item.get("first_name") or str(uid))[:22]
+            rows.append([InlineKeyboardButton(("🔓 Unban " if banned else "🚫 Ban ") + name, callback_data=f"netpanel:{'unban' if banned else 'ban'}:{uid}")])
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")])
+        await q.edit_message_text("👥 <b>Recent users</b>\nTap a user to toggle their access.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif action in ("ban", "unban") and len(data) == 3 and data[2].isdigit():
+        uid = int(data[2])
+        if uid == int(doc["owner_id"]):
+            await q.edit_message_text("You cannot ban the owner.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👥 Back to users", callback_data="netpanel:users")]])); return
+        if action == "ban":
+            await bot_bans_col.update_one({"bot_id": bot_id, "user_id": uid}, {"$set": {"bot_id": bot_id, "user_id": uid, "banned_at": datetime.now(timezone.utc)}}, upsert=True)
+            msg = f"🚫 User {uid} banned."
+        else:
+            await bot_bans_col.delete_one({"bot_id": bot_id, "user_id": uid})
+            msg = f"✅ User {uid} unbanned."
+        await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👥 Back to users", callback_data="netpanel:users")], [InlineKeyboardButton("🏠 Main menu", callback_data="netpanel:home")]]))
+    elif action == "managers":
+        items = await bot_managers_col.find({"bot_id": bot_id}).to_list(50)
+        rows = [[InlineKeyboardButton(f"➖ Remove {x['user_id']}", callback_data=f"netpanel:managerdel:{x['user_id']}")] for x in items]
+        rows.extend([[InlineKeyboardButton("➕ Add manager", callback_data="netpanel:prompt:addmanager")], [InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]])
+        await q.edit_message_text("🛠 <b>Manager management</b>\nRemove an existing manager or add a new one.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "managerdel" and len(data) == 3 and data[2].isdigit():
+        await bot_managers_col.delete_one({"bot_id": bot_id, "user_id": int(data[2])})
+        await q.edit_message_text("✅ Manager removed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛠 Managers", callback_data="netpanel:managers")], [InlineKeyboardButton("🏠 Main menu", callback_data="netpanel:home")]]))
+    elif action == "fjoin":
+        own = await owner_fsub_col.find({"bot_id": bot_id}).to_list(50)
+        platform = await global_fsub_col.find().to_list(50)
+        rows = [[InlineKeyboardButton(f"➖ Remove {str(x.get('title') or x['_id'])[:24]}", callback_data=f"netpanel:fjoindel:{x['_id']}")] for x in own]
+        rows.extend([[InlineKeyboardButton("➕ Add channel", callback_data="netpanel:prompt:addfjoin")], [InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]])
+        body = "🔒 <b>Force Join channels</b>\n\n<b>Platform-required (cannot remove):</b>\n" + ("\n".join(f"• {x.get('title','Channel')}" for x in platform) if platform else "• None configured")
+        body += "\n\n<b>Your channels:</b>\n" + ("\n".join(f"• {x.get('title','Channel')}" for x in own) if own else "• None added")
+        await q.edit_message_text(body, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "fjoindel" and len(data) == 3:
+        try: ch_id = int(data[2])
+        except ValueError: return
+        await owner_fsub_col.delete_one({"bot_id": bot_id, "_id": ch_id, "owner_id": int(doc["owner_id"])})
+        await q.edit_message_text("✅ Your channel was removed (platform channels are protected).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔒 Force Join", callback_data="netpanel:fjoin")], [InlineKeyboardButton("🏠 Main menu", callback_data="netpanel:home")]]))
+    elif action == "welcome":
+        context.user_data["netpanel_action"] = "welcome"
+        await q.edit_message_text("✏️ Send the new welcome message as your next text message. Send /cancel to stop.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]]))
+    elif action == "channel":
+        context.user_data["netpanel_action"] = "channel"
+        await q.edit_message_text("📢 Send your channel link, optionally followed by | and button text.\nExample: https://t.me/mychannel | 📢 Join my channel\nSend /cancel to stop.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]]))
+    elif action == "broadcast":
+        rows = [[InlineKeyboardButton("📝 Broadcast text", callback_data="netpanel:prompt:broadcast")], [InlineKeyboardButton("🖼 Broadcast media", callback_data="netpanel:prompt:broadcast_media")], [InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]]
+        await q.edit_message_text("📡 <b>Broadcast</b>\nChoose text or media broadcast. Only users who started this bot are targeted.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "prompt" and len(data) == 3:
+        context.user_data["netpanel_action"] = data[2]
+        prompts = {
+            "addmanager": "Send the manager's numeric Telegram user ID.",
+            "addfjoin": "Send the channel ID (example: -1001234567890). The main Gudu bot must be an admin there.",
+            "broadcast": "Send the broadcast text now.",
+            "broadcast_media": "Now send the photo, video, audio or document to broadcast.",
+        }
+        await q.edit_message_text(prompts.get(data[2], "Send the requested value now.") + "\nSend /cancel to stop.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]]))
+    else:
+        await q.edit_message_text("🎛 <b>Owner Control Center</b>", parse_mode="HTML", reply_markup=_panel_home_markup())
+
+
+async def _bot_panel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    action = context.user_data.get("netpanel_action")
+    if not action or not update.effective_user:
+        return
+    doc = await _lookup_bot(context)
+    if not doc or update.effective_user.id != int(doc["owner_id"]):
+        context.user_data.pop("netpanel_action", None)
+        return
+    msg = update.effective_message
+    value = (msg.text or "").strip()
+    bot_id = int(context.bot.id)
+    if action == "welcome":
+        if not value or len(value) > 3500:
+            await msg.reply_text("Please send welcome text between 1 and 3500 characters."); return
+        await bots_col.update_one({"_id": bot_id, "owner_id": int(doc["owner_id"])}, {"$set": {"welcome_text": value}})
+        result = "✅ Welcome message updated."
+    elif action == "channel":
+        parts = [x.strip() for x in value.split("|", 1)]
+        url = parts[0]
+        if not re.match(r"^https?://t\.me/(?:[A-Za-z0-9_]{5,}|\+[^\s]+)$", url):
+            await msg.reply_text("Invalid Telegram channel link. Example: https://t.me/mychannel | 📢 Join my channel"); return
+        label = parts[1][:50] if len(parts) > 1 and parts[1] else "📢 My Channel"
+        await bots_col.update_one({"_id": bot_id}, {"$set": {"channel_url": url, "channel_button": label}})
+        result = "✅ Your channel button has been saved."
+    elif action == "addmanager":
+        if not value.isdigit(): await msg.reply_text("Send a numeric Telegram user ID."); return
+        uid = int(value)
+        if uid == int(doc["owner_id"]): await msg.reply_text("The owner already has full access."); return
+        await bot_managers_col.update_one({"bot_id": bot_id, "user_id": uid}, {"$set": {"bot_id": bot_id, "user_id": uid, "added_by": update.effective_user.id, "added_at": datetime.now(timezone.utc)}}, upsert=True)
+        result = f"✅ User {uid} is now a manager."
+    elif action == "addfjoin":
+        if not value.lstrip("-").isdigit(): await msg.reply_text("Send a valid numeric channel ID."); return
+        ch_id = int(value)
+        try:
+            chat = await _main_bot.get_chat(ch_id)
+            member = await _main_bot.get_chat_member(ch_id, _main_bot.id)
+            if str(member.status).lower() not in ("administrator", "creator"): raise ValueError("Main bot is not admin")
+            invite = f"https://t.me/{chat.username}" if chat.username else (await _main_bot.create_chat_invite_link(ch_id, name="Bot Force Join")).invite_link
+            await owner_fsub_col.update_one({"bot_id": bot_id, "_id": ch_id}, {"$set": {"bot_id": bot_id, "owner_id": int(doc["owner_id"]), "title": chat.title, "invite_link": invite}}, upsert=True)
+            result = f"✅ Added {chat.title} to your Force Join list."
+        except Exception:
+            await msg.reply_text("❌ Could not add channel. Ensure the main Gudu bot is an admin and the channel ID is correct."); return
+    elif action == "broadcast":
+        targets = await users_col.find({"bot_id": bot_id}, {"user_id": 1}).to_list(None)
+        sent = failed = 0
+        status = await msg.reply_text(f"📡 Broadcasting to {len(targets)} users…")
+        for target in targets:
+            try: await context.bot.send_message(int(target["user_id"]), value); sent += 1
+            except Exception: failed += 1
+            await asyncio.sleep(0.04)
+        result = f"📡 Broadcast complete\n✅ Sent: {sent}\n❌ Failed: {failed}"
+        await status.edit_text(result)
+        context.user_data.pop("netpanel_action", None)
+        return
+    else:
+        return
+    context.user_data.pop("netpanel_action", None)
+    await msg.reply_text(result, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎛 Open Control Center", callback_data="netpanel:home")]]))
+
+
+async def _bot_panel_broadcast_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = await _lookup_bot(context)
+    msg = update.effective_message
+    if not doc or not update.effective_user or update.effective_user.id != int(doc["owner_id"]):
+        context.user_data.pop("netpanel_action", None); return
+    targets = await users_col.find({"bot_id": int(context.bot.id)}, {"user_id": 1}).to_list(None)
+    sent = failed = 0
+    status = await msg.reply_text(f"📡 Broadcasting media to {len(targets)} users…")
+    for target in targets:
+        try:
+            await context.bot.copy_message(int(target["user_id"]), msg.chat_id, msg.message_id); sent += 1
+        except Exception: failed += 1
+        await asyncio.sleep(0.04)
+    context.user_data.pop("netpanel_action", None)
+    await status.edit_text(f"📡 Media broadcast complete\n✅ Sent: {sent}\n❌ Failed: {failed}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎛 Open Control Center", callback_data="netpanel:home")]]))
+
+
 async def _bot_error(update, context):
     log.error("Customer bot update failed (%s)", type(context.error).__name__)
 
@@ -677,14 +934,15 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔒 Never share your bot token with anyone else.\n"
             "❌ Send /cancel to stop."
         )
-    elif data == "network_mybots":
-        docs = await bots_col.find({"owner_id": uid}).to_list(None)
+    elif data in ("network_member", "network_mybots"):
+        # The Member button is the single entry point for all owner bot controls.
+        docs = await bots_col.find({"owner_id": uid}).sort("created_at", -1).to_list(None)
         if not docs:
             await q.message.reply_text("You haven't connected a custom bot yet.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Create a Bot", callback_data="network_create")]]))
             return
         rows = [[InlineKeyboardButton(f"@{b['username']} · {b.get('status','unknown')}", callback_data=f"network_manage_{b['_id']}")] for b in docs]
         rows.append([InlineKeyboardButton("➕ Add another bot", callback_data="network_create")])
-        await q.message.reply_text("🤖 <b>Your File Share Bots</b>\nSelect a bot to manage:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        await q.message.reply_text("👤 <b>Member Control Center</b>\n\nSelect one of your bots to open its full management controls:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
     elif data.startswith("network_manage_"):
         bot_id = int(data.rsplit("_", 1)[1])
         b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
@@ -694,7 +952,7 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users = await users_col.count_documents({"bot_id": bot_id})
         files = await files_col.count_documents({"bot_id": bot_id, "owner_id": uid})
         rows = [
-            [InlineKeyboardButton("📊 Statistics", callback_data=f"network_stats_{bot_id}")],
+            [InlineKeyboardButton("📊 Statistics", callback_data=f"network_stats_{bot_id}"), InlineKeyboardButton("📁 Manage Files", callback_data=f"network_files_{bot_id}")],
             [InlineKeyboardButton("🔒 Add Force Subscribe", callback_data=f"network_addfsub_{bot_id}"), InlineKeyboardButton("📋 My Channels", callback_data=f"network_fsub_{bot_id}")],
             [InlineKeyboardButton("👥 Managers", callback_data=f"network_managers_{bot_id}"), InlineKeyboardButton("🚫 Ban / Unban", callback_data=f"network_banmenu_{bot_id}")],
             [InlineKeyboardButton("✏️ Welcome Text", callback_data=f"network_welcome_{bot_id}"), InlineKeyboardButton("📢 My Channel", callback_data=f"network_channel_{bot_id}")],
@@ -702,9 +960,33 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⏳ Auto Delete", callback_data=f"network_autodel_{bot_id}")],
             [InlineKeyboardButton("🔄 Restart", callback_data=f"network_restart_{bot_id}"), InlineKeyboardButton("⏸ Stop", callback_data=f"network_stop_{bot_id}")],
             [InlineKeyboardButton("🔐 Replace Token", callback_data=f"network_replace_{bot_id}")],
-            [InlineKeyboardButton("⬅️ My Bots", callback_data="network_mybots")],
+            [InlineKeyboardButton("⬅️ Member", callback_data="network_member")],
         ]
         await q.message.reply_text(f"🤖 <b>@{b['username']}</b>\nStatus: <b>{b.get('status','unknown')}</b>\n\n👥 Users: {users}\n📦 Files: {files}\n⏳ Auto-delete: {_fmt_time(int(b.get('auto_del',300)))}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif data.startswith("network_files_"):
+        bot_id = int(data.rsplit("_", 1)[1]); b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
+        if not b: return
+        items = await files_col.find({"bot_id": bot_id, "owner_id": uid}).sort("created_at", -1).limit(15).to_list(15)
+        rows = [[InlineKeyboardButton(f"🗑 {(x.get('file_name') or 'File')[:28]}", callback_data=f"network_delfile_{bot_id}_{x['_id']}")] for x in items]
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"network_manage_{bot_id}")])
+        body = f"📁 <b>Files for @{b['username']}</b>\nTap a file to delete it. Showing up to 15 newest files."
+        if not items: body += "\n\nNo files uploaded yet."
+        await q.message.reply_text(body, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif data.startswith("network_delfile_"):
+        parts = data.split("_", 3)
+        if len(parts) != 4 or not parts[2].isdigit(): return
+        bot_id, token = int(parts[2]), parts[3]
+        b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
+        item = await files_col.find_one({"_id": token, "bot_id": bot_id, "owner_id": uid}) if b else None
+        if not item:
+            await q.message.reply_text("File not found or you don't own this bot.")
+            return
+        try:
+            await _main_bot.delete_message(STORAGE_CHANNEL_ID, int(item["storage_message_id"]))
+        except Exception:
+            log.warning("Could not delete storage message for network file %s", token)
+        await files_col.delete_one({"_id": token, "bot_id": bot_id, "owner_id": uid})
+        await q.message.reply_text("✅ File deleted.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📁 Back to Files", callback_data=f"network_files_{bot_id}")], [InlineKeyboardButton("⬅️ Bot Controls", callback_data=f"network_manage_{bot_id}")]]))
     elif data.startswith("network_stats_"):
         bot_id = int(data.rsplit("_", 1)[1]); b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
         if not b: return
@@ -925,6 +1207,7 @@ async def network_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("network_await_token",None)
     context.user_data.pop("network_await_submit_username",None)
     context.user_data.pop("network_action",None)
+    context.user_data.pop("netpanel_action",None)
     await update.effective_message.reply_text("Cancelled.")
 
 

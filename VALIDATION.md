@@ -1,22 +1,50 @@
-# Validation Report
+# Validation notes — Member Control Center update
 
-## Automated checks completed
+## Automated checks performed
 
-- `main.py` and `network.py` compile successfully with Python's `py_compile`.
-- Both modules parse successfully with Python's AST parser.
-- Static feature checks confirm owner/manager upload authorization, per-bot bans, global plus owner force-join channels, account aggregates, member-bot force-join admin commands, and network member dashboard routes.
-- `compileall` completed successfully.
+- `python -m py_compile main.py network.py` — passed.
+- Python AST parsing of `main.py` and `network.py` — passed.
+- Confirmed the member-bot runtime registers `/panel` and `/dashboard` commands.
+- Confirmed the runtime registers the `netpanel:` callback handler and text-input handler.
+- Confirmed owner identity is checked before displaying or executing dashboard actions.
+- Confirmed dashboard actions are scoped to the current bot ID, and file deletion is scoped to the bot owner.
+- Confirmed platform force-join channels are displayed separately and cannot be removed from the member dashboard.
+- Confirmed media broadcast mode is handled before normal file-upload handling.
 
-## Not yet live-tested
+## Manual staging tests still required
 
-This environment does not have the project's Telegram/Motor dependencies installed and has no access to the production Telegram bot tokens or MongoDB. Therefore, live Telegram API behavior, MongoDB persistence, actual channel permissions, multi-bot polling, broadcasts, and end-to-end file delivery still need a staging deployment test.
+Live Telegram and MongoDB behavior cannot be certified by syntax checks alone. Before production deployment, test with a staging bot and database:
 
-## Recommended staging checks
+1. Open `/panel` as the registered owner; confirm a non-owner cannot open it.
+2. Open each dashboard section and use its Back button.
+3. Add and remove a manager; verify the manager can upload but cannot open owner controls.
+4. Ban and unban a test user; verify access is blocked and restored for this bot only.
+5. Add a personal force-join channel, verify membership gating, and remove it. Confirm platform channels remain enforced.
+6. Change welcome text and channel button; verify both appear on `/start`.
+7. Send text and media broadcasts; verify delivery counts and that media is not stored as a new file.
+8. Delete a recent file; verify the database record and storage-channel message are removed when the main bot has permission.
+9. Restart the service and confirm registered member bots start normally.
 
-1. Register a fresh member bot and complete verifier approval.
-2. Confirm a normal user cannot upload a document/video/photo/audio to that member bot, while owner and an assigned manager can.
-3. Ban a user and confirm `/start`, file links, and uploads are blocked for that bot; unban and retest.
-4. Add two owner force-join channels with `/addfjoin`, verify `/listfjoin`, and remove one with `/removefjoin`.
-5. Add a platform channel with `/fsubmem` and verify it appears and is enforced even when the member has no owner channels.
-6. Test welcome text, channel button, text broadcast, and media broadcast.
-7. Verify `/myaccount` totals and the main admin member/bot list, suspend, and reactivate actions.
+Do not change the existing Fernet token-encryption key when deploying; doing so would make already-stored encrypted bot tokens unreadable.
+
+## Force-subscribe delivery fix (2026-11-10)
+
+- `_all_required_channels()` now combines platform-wide (`network_global_fsub`) and per-member-bot channels, normalizes channel IDs, and de-duplicates overlapping entries.
+- `_check_membership()` now fails closed: only explicit `creator`, `administrator`, and `member` states pass; `left`/`kicked` are blocked; `restricted` passes only when Telegram reports `is_member=True`; API errors and unknown states block delivery.
+- Both initial deep-link delivery and the Verify callback call the same membership gate before copying a file.
+- The Force Join prompt now makes verification failures explicit and offers a retry button.
+- Automated mock checks passed for left/kicked, joined, API-error, and empty-configuration cases.
+- `python -m py_compile main.py network.py` passed.
+
+Operational check: run `/listfsubmem` in the main Gudu Gaming bot and confirm the required platform channels are listed. If it reports no channels, no platform-wide Force Subscribe rule is configured in the database, so member bots have nothing global to enforce. The main Gudu Gaming bot must be an administrator in every required channel so Telegram membership checks are authoritative.
+
+## Main-bot Member button update (2026-11-10)
+
+- The main bot `/start` menu now shows `👤 Member` only when the Telegram user owns at least one registered network bot.
+- The main-menu home callback applies the same ownership-based visibility rule.
+- `👤 Member` opens the Member Control Center, lists only bots whose `owner_id` matches the clicking user, and opens the selected bot's management dashboard.
+- Added main-bot file management for each owned bot: list up to 15 newest files and delete a selected file from MongoDB and the storage channel.
+- The bot-management menu links to statistics, file management, Force Subscribe, managers, ban/unban, welcome text, channel button, broadcast, auto-delete, restart/stop, and token replacement.
+- `python -m py_compile main.py network.py` — passed after this update.
+
+Live Telegram/MongoDB tests are still required; static checks do not prove runtime delivery or API permissions.

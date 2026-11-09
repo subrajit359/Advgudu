@@ -366,9 +366,11 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("📖 How It Works", callback_data="user_help")],
         [InlineKeyboardButton("👤 My Account", callback_data="user_account"),
          InlineKeyboardButton("📢 Official Channel", url=CHANNEL_URL)],
-        [InlineKeyboardButton("🤖 Create Your Own File Share Bot", callback_data="network_create"),
-         InlineKeyboardButton("🗂 My Bots", callback_data="network_mybots")],
+        [InlineKeyboardButton("🤖 Create Your Own File Share Bot", callback_data="network_create")],
     ]
+    # Only registered network members see the Member control center.
+    if await _db["network_bots"].find_one({"owner_id": user.id}, {"_id": 1}):
+        btn.append([InlineKeyboardButton("👤 Member", callback_data="network_member")])
     if _is_admin(user.id):
         btn.append([InlineKeyboardButton("👑 Admin Dashboard", callback_data="user_admin")])
     elif await _is_manager(user.id):
@@ -634,9 +636,11 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("📖 How It Works", callback_data="user_help")],
             [InlineKeyboardButton("👤 My Account", callback_data="user_account"),
              InlineKeyboardButton("📢 Official Channel", url=CHANNEL_URL)],
-            [InlineKeyboardButton("🤖 Create Your Own Bot", callback_data="network_create"),
-             InlineKeyboardButton("🗂 My Bots", callback_data="network_mybots")],
+            [InlineKeyboardButton("🤖 Create Your Own Bot", callback_data="network_create")],
         ]
+        # Show the Member area only to users who own at least one registered bot.
+        if await _db["network_bots"].find_one({"owner_id": q.from_user.id}, {"_id": 1}):
+            rows.append([InlineKeyboardButton("👤 Member", callback_data="network_member")])
         if _is_admin(q.from_user.id):
             rows.append([InlineKeyboardButton("👑 Admin Dashboard", callback_data="user_admin")])
         elif await _is_manager(q.from_user.id):

@@ -320,3 +320,19 @@ Only the bot owner and explicitly-added managers can upload files. All other use
 These platform channels appear in every member bot's `/listfjoin` output and are checked even when the member has not added any personal force-join channel. Member owners cannot remove platform channels. There is currently no per-member channel limit.
 
 The main admin dashboard also includes **Network Members & Bots**, showing member IDs, bot counts, individual bot statuses, and suspend/reactivate controls.
+
+## 🎛 Member Bot Control Center
+
+Each registered member bot now has an owner-only inline dashboard. Open it with `/panel` or tap **🎛 Control Center** on the bot's `/start` screen.
+
+The dashboard provides:
+- **My Account** — files, users, downloads, and managers for that bot.
+- **Files** — view the 10 most recent files and delete a selected file.
+- **Users** — view recent users and ban/unban them for this bot only.
+- **Managers** — add managers by Telegram user ID and remove existing managers.
+- **Force Join** — view platform-required channels, add personal channels, and remove personal channels. Platform channels remain protected.
+- **Welcome** — change the bot's welcome message.
+- **My Channel** — configure the channel URL and button label.
+- **Broadcast** — send text or a media message to users who have started this bot.
+
+Use `/cancel` to leave a dashboard input prompt. The dashboard is owner-only; managers retain their upload permissions but do not receive owner controls.
