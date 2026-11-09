@@ -248,3 +248,75 @@ The platform enforces a maximum of 2 GB per upload. Uploads are forwarded server
 ### Important operational limits
 
 Every connected custom bot uses its own Telegram long-polling connection and must be an admin in the network storage channel. Railway resource use grows with the number of connected bots; monitor CPU, memory, and Telegram API limits as the network grows. The auto-delete setting removes the delivered copy from a recipient's chat; it does not delete the source message in the private storage channel.
+
+## 🤖 Custom Bot Verification Queue
+
+After a customer submits a valid BotFather token, the main bot asks them to submit their bot username into the Gudu Gaming bot. The username is stored in a shared verification queue; customers do not need to DM either verifier. The owner configures up to two verifier Telegram user IDs from the `/admin` → **Bot Verifiers** section, using `/setbotverifier 1 USER_ID` and `/setbotverifier 2 USER_ID`. Configured verifiers run `/botverifyqueue` in the main bot to collect pending usernames, then manually add each customer bot to the private storage channel with **Post Messages** permission. The customer taps **Continue Verification** to run the final access/admin/permission checks and start their bot.
+
+
+## Member Bot Owner Features (updated)
+
+A Gudu Network member is the Telegram account that registered and owns one or more custom bots. Each member bot has isolated users, files, managers, bans, force-join channels, welcome text, and channel settings.
+
+### Owner commands inside each member bot
+
+| Command | Purpose |
+|---|---|
+| `/myaccount` | Total bots, files, users, downloads, and managers across the member's bots |
+| `/addmanager USER_ID` | Add a manager to this bot |
+| `/removemanager USER_ID` | Remove a manager |
+| `/listmanagers` | List this bot's managers |
+| `/ban USER_ID` / `/unban USER_ID` | Block or restore a user for this bot only |
+| `/addfjoin CHANNEL_ID` | Add an owner-managed force-join channel |
+| `/listfjoin` | List both Gudu-mandated and owner-managed channels |
+| `/removefjoin CHANNEL_ID` | Remove an owner-managed channel only |
+| `/setwelcome TEXT` | Customize the bot's welcome message |
+| `/setchannel URL [Button text]` | Add a channel button to `/start` |
+| `/broadcast TEXT` | Broadcast text to users who have started the bot |
+| `/broadcast` (reply to media) | Copy a media/message broadcast to users |
+
+Only the bot owner and explicitly-added managers can upload files. All other users can only receive files through share links. A ban applies to that member bot only. Managers can upload but cannot change owner settings or manage other users.
+
+### Gudu admin controls for member bots
+
+- `/fsubmem CHANNEL_ID` — add a mandatory force-join channel to every member bot.
+- `/listfsubmem` — list mandatory member-bot channels.
+- `/removefsubmem CHANNEL_ID` — remove a mandatory channel.
+
+These platform channels appear in every member bot's `/listfjoin` output and are checked even when the member has not added any personal force-join channel. Member owners cannot remove platform channels. There is currently no per-member channel limit.
+
+The main admin dashboard also includes **Network Members & Bots**, showing member IDs, bot counts, individual bot statuses, and suspend/reactivate controls.
+
+
+## Member Bot Owner Features (updated)
+
+A Gudu Network member is the Telegram account that registered and owns one or more custom bots. Each member bot has isolated users, files, managers, bans, force-join channels, welcome text, and channel settings.
+
+### Owner commands inside each member bot
+
+| Command | Purpose |
+|---|---|
+| `/myaccount` | Total bots, files, users, downloads, and managers across the member's bots |
+| `/addmanager USER_ID` | Add a manager to this bot |
+| `/removemanager USER_ID` | Remove a manager |
+| `/listmanagers` | List this bot's managers |
+| `/ban USER_ID` / `/unban USER_ID` | Block or restore a user for this bot only |
+| `/addfjoin CHANNEL_ID` | Add an owner-managed force-join channel |
+| `/listfjoin` | List both Gudu-mandated and owner-managed channels |
+| `/removefjoin CHANNEL_ID` | Remove an owner-managed channel only |
+| `/setwelcome TEXT` | Customize the bot's welcome message |
+| `/setchannel URL [Button text]` | Add a channel button to `/start` |
+| `/broadcast TEXT` | Broadcast text to users who have started the bot |
+| `/broadcast` (reply to media) | Copy a media/message broadcast to users |
+
+Only the bot owner and explicitly-added managers can upload files. All other users can only receive files through share links. A ban applies to that member bot only. Managers can upload but cannot change owner settings or manage other users.
+
+### Gudu admin controls for member bots
+
+- `/fsubmem CHANNEL_ID` — add a mandatory force-join channel to every member bot.
+- `/listfsubmem` — list mandatory member-bot channels.
+- `/removefsubmem CHANNEL_ID` — remove a mandatory channel.
+
+These platform channels appear in every member bot's `/listfjoin` output and are checked even when the member has not added any personal force-join channel. Member owners cannot remove platform channels. There is currently no per-member channel limit.
+
+The main admin dashboard also includes **Network Members & Bots**, showing member IDs, bot counts, individual bot statuses, and suspend/reactivate controls.

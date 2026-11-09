@@ -19,7 +19,7 @@ from config import (
 from network import (
     startup_network_bots, shutdown_network_bots, network_callback,
     network_text_message, cmd_network_fsub_add, cmd_network_fsub_remove,
-    cmd_network_fsub_list, network_cancel,
+    cmd_network_fsub_list, network_cancel, cmd_botverifyqueue, cmd_setbotverifier,
 )
 
 logging.basicConfig(format="%(asctime)s — %(levelname)s — %(message)s", level=logging.INFO)
@@ -514,11 +514,19 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")]])
         await _edit_callback_message(q, text, markup)
     elif q.data == "user_account":
+        member_bots = await _db["network_bots"].find({"owner_id": q.from_user.id}).to_list(None)
+        bot_ids = [int(b["_id"]) for b in member_bots]
+        member_files = await _db["network_files"].count_documents({"bot_id": {"$in": bot_ids}}) if bot_ids else 0
+        member_users = await _db["network_users"].count_documents({"bot_id": {"$in": bot_ids}}) if bot_ids else 0
+        member_managers = await _db["network_bot_managers"].count_documents({"bot_id": {"$in": bot_ids}}) if bot_ids else 0
+        member_downloads = await _db["network_users"].aggregate([{"$match": {"bot_id": {"$in": bot_ids}}}, {"$group": {"_id": None, "n": {"$sum": "$downloads"}}}]).to_list(1) if bot_ids else []
         text = (
             "👤 <b>Your Gudu Gaming Account</b>\n\n"
             f"🆔 Telegram ID: <code>{q.from_user.id}</code>\n"
-            f"📛 Name: {q.from_user.first_name}\n\n"
-            "Your account is ready to receive shared files."
+            f"📛 Name: {q.from_user.first_name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')}\n\n"
+            f"🤖 Your bots: <b>{len(bot_ids)}</b>\n📦 Files: <b>{member_files}</b>\n"
+            f"👥 Users: <b>{member_users}</b>\n📥 Downloads: <b>{member_downloads[0]['n'] if member_downloads else 0}</b>\n"
+            f"🛠 Managers: <b>{member_managers}</b>"
         )
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")]])
         await _edit_callback_message(q, text, markup)
@@ -796,19 +804,26 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     files = await db_file_count()
     manager_count = await managers_col.count_documents({})
     active_keys = await db_active_key_count()
+    network_bots_count = await _db["network_bots"].count_documents({})
+    network_members_count = await _db["network_bots"].distinct("owner_id")
+    network_member_total = len(network_members_count)
     text = (
         f"👑 <b>{BOT_NAME} Control Center</b>\n"
         "<i>Manage your bot from one place.</i>\n\n"
         f"👥 <b>{users}</b> users     📦 <b>{files}</b> files\n"
         f"🔑 <b>{active_keys}</b> active keys\n"
         f"🔒 <b>{len(fsub)}</b> force-sub channels     ⏳ <b>{_fmt_del(auto_del)}</b> auto-delete\n"
-        f"🛠 <b>{manager_count}</b> AdminGG managers\n\n"
+        f"🛠 <b>{manager_count}</b> AdminGG managers\n"
+        f"🤖 <b>{network_bots_count}</b> member bots · 👤 <b>{network_member_total}</b> network members\n\n"
         "Select a management section:"
     )
     btns = [
         [InlineKeyboardButton("📊 Overview & Stats", callback_data="adm_stats")],
         [InlineKeyboardButton("🛠 Manager Management (AdminGG)", callback_data="adm_managers")],
-        [InlineKeyboardButton("🔒 Force Sub Channels", callback_data="adm_listfsub")],
+        [InlineKeyboardButton("🤖 Bot Verifiers", callback_data="adm_bot_verifiers")],
+        [InlineKeyboardButton("👥 Network Members & Bots", callback_data="adm_network_members")],
+        [InlineKeyboardButton("📢 Member-Bot Force Join", callback_data="adm_fsubmem_list")],
+        [InlineKeyboardButton("🔒 Main-Bot Force Sub", callback_data="adm_listfsub")],
         [InlineKeyboardButton("📝 Edit Messages", callback_data="adm_listmsgs"),
          InlineKeyboardButton("📦 List Files", callback_data="adm_listfiles")],
         [InlineKeyboardButton("➕ Add FSub", callback_data="adm_addfsub_help"),
@@ -837,7 +852,93 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     d = q.data
 
-    if d == "adm_managers":
+    if d == "adm_bot_verifiers":
+        verifier_doc = await _db["network_settings"].find_one({"_id": "bot_verifiers"}) or {}
+        verifier_ids = list(verifier_doc.get("ids", [None, None]))
+        while len(verifier_ids) < 2: verifier_ids.append(None)
+        text = (
+            "🤖 <b>Bot Verifier Settings</b>\n\n"
+            f"Verifier 1: <code>{verifier_ids[0] or 'Not set'}</code>\n"
+            f"Verifier 2: <code>{verifier_ids[1] or 'Not set'}</code>\n\n"
+            "Set or change a verifier with:\n"
+            "<code>/setbotverifier 1 USER_ID</code>\n"
+            "<code>/setbotverifier 2 USER_ID</code>\n"
+            "Use <code>0</code> as USER_ID to clear a slot.\n\n"
+            "Verifiers collect submitted usernames inside the bot using /botverifyqueue. "
+            "Users do not need to DM verifiers."
+        )
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=_back_btn())
+
+    elif d == "adm_fsubmem_list":
+        channels = await _db["network_global_fsub"].find().to_list(None)
+        text = "📢 <b>Mandatory Force Join for Every Member Bot</b>\n\n"
+        if channels:
+            text += "\n".join(f"• {c.get('title','Channel')} — <code>{c['_id']}</code>" for c in channels)
+        else:
+            text += "No mandatory member-bot channels configured yet."
+        text += "\n\nAdd: <code>/fsubmem CHANNEL_ID</code>\nRemove: <code>/removefsubmem CHANNEL_ID</code>\nList: <code>/listfsubmem</code>"
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=_back_btn())
+
+    elif d == "adm_network_members" or d.startswith("adm_network_members_p"):
+        bot_col = _db["network_bots"]
+        page = int(d.rsplit("_p", 1)[1]) if "_p" in d else 0
+        per_page = 15
+        pipeline = [{"$group": {"_id": "$owner_id", "bots": {"$sum": 1}, "usernames": {"$push": "$username"}, "statuses": {"$push": "$status"}}}, {"$sort": {"bots": -1}}, {"$skip": page * per_page}, {"$limit": per_page}]
+        members = await bot_col.aggregate(pipeline).to_list(per_page)
+        all_member_ids = await bot_col.distinct("owner_id")
+        total_members = len(all_member_ids)
+        total_bots = await bot_col.count_documents({})
+        text = f"👥 <b>Network Members</b>\n\nMembers: <b>{total_members}</b>\nTotal bots: <b>{total_bots}</b>\nPage: <b>{page + 1}/{max(1, (total_members + per_page - 1) // per_page)}</b>\n\n"
+        rows = []
+        for m in members:
+            names = ", ".join("@" + str(x) for x in m.get("usernames", [])[:3])
+            text += f"👤 <code>{m['_id']}</code> — <b>{m['bots']} bot(s)</b>\n{names}\n\n"
+            rows.append([InlineKeyboardButton(f"👤 {m['_id']} · {m['bots']} bot(s)", callback_data=f"adm_member_{m['_id']}")])
+        if not members:
+            text += "No network members have registered bots yet."
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"adm_network_members_p{page - 1}"))
+        if (page + 1) * per_page < total_members:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"adm_network_members_p{page + 1}"))
+        if nav: rows.append(nav)
+        rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"adm_network_members_p{page}"), InlineKeyboardButton("⬅️ Dashboard", callback_data="adm_back")])
+        await _edit_callback_message(q, text[:3900], parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif d.startswith("adm_member_") and not (d.startswith("adm_member_suspend_") or d.startswith("adm_member_resume_")):
+        try: member_id = int(d[len("adm_member_"):])
+        except ValueError:
+            await q.message.reply_text("Invalid member."); return
+        bots = await _db["network_bots"].find({"owner_id": member_id}).to_list(None)
+        if not bots:
+            await q.message.reply_text("Member has no registered bots."); return
+        text = f"👤 <b>Member:</b> <code>{member_id}</code>\n🤖 Bots: <b>{len(bots)}</b>\n\n"
+        for b in bots:
+            text += f"• @{b.get('username','unknown')} — {b.get('status','unknown')} (ID <code>{b['_id']}</code>)\n"
+        rows = [[InlineKeyboardButton("🚫 Suspend member bots", callback_data=f"adm_member_suspend_{member_id}")], [InlineKeyboardButton("▶️ Reactivate bots", callback_data=f"adm_member_resume_{member_id}")], [InlineKeyboardButton("⬅️ Members", callback_data="adm_network_members")]]
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif d.startswith("adm_member_suspend_") or d.startswith("adm_member_resume_"):
+        suspend = d.startswith("adm_member_suspend_")
+        try: member_id = int(d.rsplit("_", 1)[1])
+        except ValueError:
+            await q.message.reply_text("Invalid member."); return
+        bots = await _db["network_bots"].find({"owner_id": member_id}).to_list(None)
+        from network import _stop_runtime
+        for b in bots:
+            if suspend:
+                await _stop_runtime(int(b["_id"]))
+                await _db["network_bots"].update_one({"_id": b["_id"]}, {"$set": {"status": "stopped_by_admin"}})
+            else:
+                try:
+                    await _db["network_bots"].update_one({"_id": b["_id"]}, {"$set": {"status": "starting"}})
+                    from network import _start_runtime
+                    await _start_runtime(await _db["network_bots"].find_one({"_id": b["_id"]}))
+                except Exception:
+                    await _db["network_bots"].update_one({"_id": b["_id"]}, {"$set": {"status": "error"}})
+        await _edit_callback_message(q, f"{'🚫 Suspended' if suspend else '▶️ Reactivation attempted'} bots for member <code>{member_id}</code>.\n\nSome bots may remain in error if Telegram rejects their token or permissions.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Members", callback_data="adm_network_members")], [InlineKeyboardButton("🏠 Dashboard", callback_data="adm_back")]]))
+
+    elif d == "adm_managers":
         managers = await managers_col.find({}, {"_id": 1}).to_list(None)
         text = (
             "🛠 <b>AdminGG Manager Management</b>\n\n"
@@ -857,11 +958,11 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             uid = int(d[len("adm_mgr_remove_"):])
         except ValueError:
-            await q.answer("Invalid manager ID", show_alert=True)
+            await q.message.reply_text("Invalid manager ID.")
             return
         exists = await managers_col.find_one({"_id": uid})
         if not exists:
-            await q.answer("Manager not found", show_alert=True)
+            await q.message.reply_text("Manager not found.")
             return
         await _edit_callback_message(q, 
             f"⚠️ <b>Remove AdminGG manager?</b>\n\nUser ID: <code>{uid}</code>\n\nThis user will lose upload and share-link access.",
@@ -877,10 +978,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             uid = int(d[len("adm_mgr_confirm_"):])
         except ValueError:
-            await q.answer("Invalid manager ID", show_alert=True)
+            await q.message.reply_text("Invalid manager ID.")
             return
         result = await managers_col.delete_one({"_id": uid})
-        await q.answer("Manager removed" if result.deleted_count else "Manager not found")
+        await q.message.reply_text("Manager removed." if result.deleted_count else "Manager not found.")
         managers = await managers_col.find({}, {"_id": 1}).to_list(None)
         text = "🛠 <b>AdminGG Manager Management</b>\n\n" + (f"👥 Total managers: <b>{len(managers)}</b>\n\n" if managers else "No managers currently added.\n\n")
         text += "➕ Add manager: <code>/addmanager USER_ID</code>\n➖ Remove managers with the buttons below."
@@ -993,7 +1094,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             await db_del_file(token)
-        await q.answer("🗑 Deleted!", show_alert=False)
+        await q.message.reply_text("🗑 File deleted.")
         per_page = 8
         all_files = await db_list_files(200)
         total = len(all_files)
@@ -1467,6 +1568,11 @@ def main():
     app.add_handler(CommandHandler("networkfsubadd", cmd_network_fsub_add))
     app.add_handler(CommandHandler("networkfsubremove", cmd_network_fsub_remove))
     app.add_handler(CommandHandler("networkfsublist", cmd_network_fsub_list))
+    app.add_handler(CommandHandler("fsubmem", cmd_network_fsub_add))
+    app.add_handler(CommandHandler("removefsubmem", cmd_network_fsub_remove))
+    app.add_handler(CommandHandler("listfsubmem", cmd_network_fsub_list))
+    app.add_handler(CommandHandler("botverifyqueue", cmd_botverifyqueue))
+    app.add_handler(CommandHandler("setbotverifier", cmd_setbotverifier))
     app.add_handler(CommandHandler("addfsub", cmd_addfsub))
     app.add_handler(CommandHandler("setfsublink", cmd_setfsublink))
     app.add_handler(CommandHandler("removefsub", cmd_removefsub))
