@@ -19,7 +19,7 @@ from config import (
 from network import (
     startup_network_bots, shutdown_network_bots, network_callback,
     network_text_message, cmd_network_fsub_add, cmd_network_fsub_remove,
-    cmd_network_fsub_list, network_cancel, bots_col as network_bots_col,
+    cmd_network_fsub_list, network_cancel,
 )
 
 logging.basicConfig(format="%(asctime)s — %(levelname)s — %(message)s", level=logging.INFO)
@@ -796,16 +796,11 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     files = await db_file_count()
     manager_count = await managers_col.count_documents({})
     active_keys = await db_active_key_count()
-    custom_bot_count = await network_bots_col.count_documents({})
-    custom_bot_owners = len(await network_bots_col.distinct("owner_id"))
-    running_custom_bots = await network_bots_col.count_documents({"status": "running"})
     text = (
         f"👑 <b>{BOT_NAME} Control Center</b>\n"
         "<i>Manage your bot from one place.</i>\n\n"
         f"👥 <b>{users}</b> users     📦 <b>{files}</b> files\n"
         f"🔑 <b>{active_keys}</b> active keys\n"
-        f"🤖 <b>{custom_bot_owners}</b> custom-bot users     🧩 <b>{custom_bot_count}</b> custom bots\n"
-        f"🟢 <b>{running_custom_bots}</b> running custom bots\n"
         f"🔒 <b>{len(fsub)}</b> force-sub channels     ⏳ <b>{_fmt_del(auto_del)}</b> auto-delete\n"
         f"🛠 <b>{manager_count}</b> AdminGG managers\n\n"
         "Select a management section:"
@@ -899,9 +894,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👥 Users: <b>{await db_user_count()}</b>\n"
             f"📦 Files: <b>{await db_file_count()}</b>\n"
             f"🔑 Active Keys: <b>{await db_active_key_count()}</b>\n"
-            f"🤖 Custom-Bot Users: <b>{len(await network_bots_col.distinct('owner_id'))}</b>\n"
-            f"🧩 Total Custom Bots: <b>{await network_bots_col.count_documents({})}</b>\n"
-            f"🟢 Running Custom Bots: <b>{await network_bots_col.count_documents({'status': 'running'})}</b>\n"
             f"🔒 FSub: <b>{len(await db_get_fsub())}</b>\n"
             f"⏳ Auto Del: <b>{_fmt_del(await db_get_auto_del())}</b>"
         )

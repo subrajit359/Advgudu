@@ -35,15 +35,14 @@ _raw_storage_id = int(os.environ.get("NETWORK_STORAGE_CHANNEL_ID", "3959825660")
 # Telegram channel IDs returned without the -100 prefix are normalized here.
 STORAGE_CHANNEL_ID = int(f"-100{abs(_raw_storage_id)}") if _raw_storage_id > 0 else _raw_storage_id
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
-TOKEN_KEY = os.environ.get("BOT_TOKEN_ENCRYPTION_KEY", "").strip()
+# Hard-coded Fernet key. Keep this exact key to preserve access to encrypted bot tokens.
+TOKEN_KEY = "vHnLKpEk6eC-NL5yi14tFLe4fGJL1Zw9PJYHB2NpqnA="
 _main_bot = Bot(BOT_TOKEN)
 _running = {}  # bot_id -> Application
 _start_lock = asyncio.Lock()
 
 
 def _cipher():
-    if not TOKEN_KEY:
-        raise RuntimeError("BOT_TOKEN_ENCRYPTION_KEY is not configured")
     try:
         return Fernet(TOKEN_KEY.encode())
     except Exception as exc:
@@ -131,9 +130,6 @@ async def startup_network_bots():
     await bots_col.create_index("username", unique=True, sparse=True)
     await files_col.create_index([("bot_id", 1), ("owner_id", 1)])
     await users_col.create_index([("bot_id", 1), ("user_id", 1)], unique=True)
-    if not TOKEN_KEY:
-        log.warning("Custom bot network is disabled until BOT_TOKEN_ENCRYPTION_KEY is configured")
-        return
     async for doc in bots_col.find({"status": {"$ne": "stopped"}}):
         try:
             await _start_runtime(doc)
@@ -355,9 +351,6 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     data = q.data
     if data == "network_create":
-        if not TOKEN_KEY:
-            await q.message.reply_text("⚠️ Custom bot creation is not configured yet. The owner must set BOT_TOKEN_ENCRYPTION_KEY in Railway variables.")
-            return
         context.user_data["network_await_token"] = True
         await q.message.reply_text("🤖 Create your bot with @BotFather, add it as an administrator to the Gudu Gaming Network Storage channel, then send its token here. Never share the token with anyone else. Send /cancel to stop.")
     elif data == "network_mybots":

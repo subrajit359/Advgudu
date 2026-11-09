@@ -224,7 +224,7 @@ Users can connect their own Telegram file-sharing bot from the main menu using *
 ### Required Railway variables
 
 - `NETWORK_STORAGE_CHANNEL_ID=3959825660` (the code normalizes this raw channel ID to `-1003959825660`; if you already have the full `-100...` ID, set that instead).
-- `BOT_TOKEN_ENCRYPTION_KEY`: generate once using `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Keep it secret and never rotate/lose it without migrating all encrypted bot tokens.
+- Bot-token encryption uses a Fernet key hard-coded in `network.py` as `TOKEN_KEY`. Keep that exact key secret and unchanged; changing or losing it prevents decrypting previously stored bot tokens.
 
 ### Storage channel setup
 
@@ -238,7 +238,7 @@ The platform enforces a maximum of 2 GB per upload. Uploads are forwarded server
 
 ### Security and isolation
 
-- Bot tokens are encrypted at rest with Fernet; the encryption key is supplied via `BOT_TOKEN_ENCRYPTION_KEY`.
+- Bot tokens are encrypted at rest with Fernet; the encryption key is hard-coded as `TOKEN_KEY` in `network.py`.
 - Telegram `getMe` validates each token; the Telegram bot ID is the unique ownership key, so one bot cannot be registered to multiple Gudu Gaming accounts.
 - Token replacement only accepts a new token for the same Telegram bot ID.
 - Each file record is scoped to its bot ID and owner ID.
