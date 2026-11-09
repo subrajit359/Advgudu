@@ -60,6 +60,29 @@ def _decrypt(value):
         raise RuntimeError("Stored bot token cannot be decrypted; check BOT_TOKEN_ENCRYPTION_KEY") from exc
 
 
+
+async def _validate_customer_bot_access(candidate, bot_id):
+    """Verify the customer bot can access the configured destination."""
+    try:
+        chat = await candidate.get_chat(STORAGE_CHANNEL_ID)
+    except TelegramError as exc:
+        raise ValueError(
+            "The bot cannot access the configured destination. Confirm the destination ID and add the bot to it."
+        ) from exc
+    try:
+        member = await candidate.get_chat_member(chat.id, bot_id)
+    except TelegramError as exc:
+        raise ValueError(
+            "Telegram could not verify the bot's administrator membership in the configured destination."
+        ) from exc
+    status = str(member.status).lower()
+    if status not in ("administrator", "creator"):
+        raise ValueError("The bot must be an administrator in the configured destination.")
+    # Channel admins need the post permission for forwarded files to be accepted.
+    if status == "administrator" and getattr(member, "can_post_messages", True) is False:
+        raise ValueError("The bot administrator role is missing permission to post messages.")
+    return chat, member
+
 def _token():
     return "GGN_" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(18))
 
@@ -109,13 +132,37 @@ async def _start_runtime(doc):
             _bot_upload,
         ))
         app.add_error_handler(_bot_error)
-        await app.initialize()
-        await app.start()
+        # Follow PTB's documented manual lifecycle: initialize -> start polling -> start.
+        # Starting the updater first also avoids a partially-started Application if
+        # Telegram rejects polling because another process owns this bot's updates.
+        updater_started = False
+        app_started = False
         try:
-            await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+            await app.initialize()
+            if app.updater is None:
+                raise RuntimeError("Polling updater is unavailable")
+            await app.updater.start_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES,
+            )
+            updater_started = True
+            await app.start()
+            app_started = True
         except Exception:
-            await app.stop()
-            await app.shutdown()
+            if updater_started and app.updater and app.updater.running:
+                try:
+                    await app.updater.stop()
+                except Exception:
+                    log.exception("Failed to stop updater after startup failure for bot %s", bot_id)
+            if app_started and app.running:
+                try:
+                    await app.stop()
+                except Exception:
+                    log.exception("Failed to stop application after startup failure for bot %s", bot_id)
+            try:
+                await app.shutdown()
+            except Exception:
+                log.exception("Failed to shut down application after startup failure for bot %s", bot_id)
             raise
         _running[bot_id] = app
         await bots_col.update_one({"_id": bot_id}, {"$set": {"status": "running", "last_started_at": datetime.now(timezone.utc)}})
@@ -274,11 +321,11 @@ async def _bot_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         link = f"https://t.me/{context.bot.username}?start={token}"
         await msg.reply_text(
-            f"✅ Upload saved to Gudu Gaming Network Storage\n\n📄 {fname}\n💾 {_fmt_size(size)}\n🔗 Share link:\n{link}"
+            f"✅ Your file is ready!\n\n📄 {fname}\n💾 {_fmt_size(size)}\n🔗 Share link:\n{link}"
         )
     except Exception:
         log.error("Could not forward custom bot upload to network storage channel")
-        await msg.reply_text("❌ Upload failed. Please check that this bot is an administrator in the Gudu Gaming Network Storage channel with permission to post messages.")
+        await msg.reply_text("❌ Upload failed. Please try again later or contact support.")
 
 
 async def _bot_error(update, context):
@@ -305,10 +352,7 @@ async def handle_network_token(update: Update, context: ContextTypes.DEFAULT_TYP
         me = await candidate.get_me()
         if not me.is_bot or not me.username:
             raise ValueError("Token does not identify a bot")
-        # The bot itself must be able to post to and copy messages from storage.
-        member = await candidate.get_chat_member(STORAGE_CHANNEL_ID, me.id)
-        if str(member.status).lower() not in ("administrator", "creator"):
-            raise ValueError("Add this bot as an administrator in the network storage channel")
+        await _validate_customer_bot_access(candidate, me.id)
         existing = await bots_col.find_one({"_id": me.id})
         if existing and int(existing.get("owner_id", 0)) != uid:
             await update.message.reply_text("❌ This bot is already registered to another Gudu Gaming account.")
@@ -323,16 +367,35 @@ async def handle_network_token(update: Update, context: ContextTypes.DEFAULT_TYP
             "status": "starting", "auto_del": 300, "created_at": datetime.now(timezone.utc),
         })
         doc = await bots_col.find_one({"_id": me.id})
-        await _start_runtime(doc)
+        try:
+            await _start_runtime(doc)
+        except Exception:
+            # Do not leave a failed registration blocking the user from retrying.
+            await bots_col.delete_one({"_id": me.id, "owner_id": uid})
+            raise
         context.user_data.pop("network_await_token", None)
         await update.message.reply_text(
             f"🎉 Your bot is connected!\n\n🤖 @{me.username}\n🟢 Status: Running\n\nOpen @{me.username} and send a file to test it."
         )
     except Exception as exc:
-        log.warning("Custom bot registration failed for user %s (%s)", uid, type(exc).__name__)
+        # Never log the submitted token. Log a sanitized diagnostic for the operator.
+        safe_error = re.sub(r"\d{5,15}:[A-Za-z0-9_-]{20,}", "[REDACTED_TOKEN]", str(exc))
+        log.error(
+            "Custom bot registration failed for user %s; error_type=%s; detail=%s",
+            uid, type(exc).__name__, safe_error[:500],
+        )
+        # Give a useful, safe reason without exposing the submitted token or internals.
+        if isinstance(exc, ValueError):
+            public_reason = "The bot's required access could not be verified."
+        elif isinstance(exc, TelegramError):
+            public_reason = "Telegram could not complete the setup check."
+        else:
+            public_reason = "The service could not start the bot after verification."
         await update.message.reply_text(
-            "❌ I couldn't connect this bot. Check that the token is valid, encryption is configured, "
-            "and the bot is an administrator in the network storage channel. No token is shown in this error."
+            "❌ I couldn't connect your bot. Your token was verified, but setup could not be completed.\n\n"
+            f"Reason: {public_reason}\n\n"
+            "Please confirm the bot has the required administrator permissions, then try again. "
+            "Your token is never shown here."
         )
     finally:
         if 'candidate' in locals():
@@ -352,7 +415,16 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
     if data == "network_create":
         context.user_data["network_await_token"] = True
-        await q.message.reply_text("🤖 Create your bot with @BotFather, add it as an administrator to the Gudu Gaming Network Storage channel, then send its token here. Never share the token with anyone else. Send /cancel to stop.")
+        await q.message.reply_text(
+            "🤖 Connect Your Telegram Bot\n\n"
+            "Step 1: Open @BotFather.\n"
+            "Step 2: Send /newbot and follow the instructions.\n"
+            "Step 3: Choose a name and username for your bot.\n"
+            "Step 4: Copy the API token provided by BotFather.\n"
+            "Step 5: Send the token here to complete setup.\n\n"
+            "🔒 Never share your bot token with anyone else.\n"
+            "❌ Send /cancel to stop."
+        )
     elif data == "network_mybots":
         docs = await bots_col.find({"owner_id": uid}).to_list(None)
         if not docs:
@@ -463,15 +535,13 @@ async def network_text_message(update: Update, context: ContextTypes.DEFAULT_TYP
             candidate=Bot(token); await candidate.initialize(); me=await candidate.get_me()
             if me.id != int(bot_id):
                 raise ValueError("Token is for a different bot")
-            member=await candidate.get_chat_member(STORAGE_CHANNEL_ID,me.id)
-            if str(member.status).lower() not in ("administrator","creator"):
-                raise ValueError("Bot is not admin in storage")
+            await _validate_customer_bot_access(candidate, me.id)
             await bots_col.update_one({"_id":bot_id,"owner_id":uid},{"$set":{"token_enc":_encrypt(token),"username":me.username,"display_name":me.first_name,"status":"starting"}})
             await _stop_runtime(bot_id)
             doc=await bots_col.find_one({"_id":bot_id}); await _start_runtime(doc)
             await update.message.reply_text("✅ Token replaced and bot restarted. Delete the old token from any place where it was exposed.")
         except Exception:
-            await update.message.reply_text("❌ Token replacement failed. Use a valid new token for the same bot and keep it admin in the storage channel.")
+            await update.message.reply_text("❌ Token replacement failed. Check the token and the bot's required permissions, then try again.")
         finally:
             if 'candidate' in locals():
                 try: await candidate.shutdown()
