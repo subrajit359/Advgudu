@@ -216,3 +216,35 @@ The bot owner (`OWNER_ID`) can assign limited upload managers:
 - `/listmanagers` — list current managers.
 
 Managers see an **AdminGG** button and can upload supported documents, photos, videos, and audio. The bot stores each upload and returns its share link. Managers cannot access the owner dashboard, change settings, manage force-sub channels, broadcast, ban users, or delete files. Manager assignments are stored in MongoDB and persist across redeployments.
+
+## 🤖 Gudu Gaming Custom Bot Network (new)
+
+Users can connect their own Telegram file-sharing bot from the main menu using **Create Your Own File Share Bot**. Their custom bot only accepts owner uploads and serves generated share links. Owners manage statistics, owner Force Subscribe channels, auto-delete duration, restart/stop, and token replacement from **My Bots** in the main Gudu Gaming bot.
+
+### Required Railway variables
+
+- `NETWORK_STORAGE_CHANNEL_ID=3959825660` (the code normalizes this raw channel ID to `-1003959825660`; if you already have the full `-100...` ID, set that instead).
+- `BOT_TOKEN_ENCRYPTION_KEY`: generate once using `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Keep it secret and never rotate/lose it without migrating all encrypted bot tokens.
+
+### Storage channel setup
+
+Create/use the dedicated private Gudu Gaming Network Storage channel. Each custom bot must be added as an administrator with permission to post messages. The custom bot forwards uploaded messages into this channel; the file payload stays on Telegram and MongoDB stores the storage message ID and ownership metadata. The channel ID supplied for this project is `3959825660` (normalized internally to `-1003959825660`).
+
+The main Gudu Gaming bot must be an administrator in any channel used for membership verification. The platform owner can configure mandatory Gudu Gaming channels separately using `/networkfsubadd CHANNEL_ID`, `/networkfsublist`, and `/networkfsubremove CHANNEL_ID`. These mandatory channels are stored separately and cannot be removed by custom-bot owners. Each custom-bot owner can add their own channels from My Bots; the main Gudu Gaming bot must also be admin in those channels so it can verify membership.
+
+### File size note
+
+The platform enforces a maximum of 2 GB per upload. Uploads are forwarded server-side from the owner's custom bot to the storage channel, avoiding a download/re-upload through Railway. Telegram/Bot API behavior for very large files can vary; test a large file on the deployed bots before advertising guaranteed 2 GB delivery. Protected-content messages cannot be forwarded.
+
+### Security and isolation
+
+- Bot tokens are encrypted at rest with Fernet; the encryption key is supplied via `BOT_TOKEN_ENCRYPTION_KEY`.
+- Telegram `getMe` validates each token; the Telegram bot ID is the unique ownership key, so one bot cannot be registered to multiple Gudu Gaming accounts.
+- Token replacement only accepts a new token for the same Telegram bot ID.
+- Each file record is scoped to its bot ID and owner ID.
+- Each custom bot runs as a polling application within the shared Python service.
+- Custom bots are separate from the original Gudu Gaming bot's files, keys, settings, and AdminGG data.
+
+### Important operational limits
+
+Every connected custom bot uses its own Telegram long-polling connection and must be an admin in the network storage channel. Railway resource use grows with the number of connected bots; monitor CPU, memory, and Telegram API limits as the network grows. The auto-delete setting removes the delivered copy from a recipient's chat; it does not delete the source message in the private storage channel.

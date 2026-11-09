@@ -16,6 +16,11 @@ from config import (
     DB_URI, DB_NAME, DB_CHANNEL, AUTO_DEL,
     START_PHOTO, FSUB_PHOTO, DEFAULT_MESSAGES,
 )
+from network import (
+    startup_network_bots, shutdown_network_bots, network_callback,
+    network_text_message, cmd_network_fsub_add, cmd_network_fsub_remove,
+    cmd_network_fsub_list, network_cancel, bots_col as network_bots_col,
+)
 
 logging.basicConfig(format="%(asctime)s — %(levelname)s — %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -85,6 +90,15 @@ async def db_user_count():
 
 async def db_file_count():
     return await files_col.count_documents({})
+
+
+async def db_active_key_count():
+    now = _utcnow()
+    return await keys_col.count_documents({
+        "status": "active",
+        "revoked": {"$ne": True},
+        "$or": [{"expires_at": {"$gt": now}}, {"expires_at": {"$exists": False}}],
+    })
 
 
 async def db_is_banned(uid):
@@ -352,6 +366,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("📖 How It Works", callback_data="user_help")],
         [InlineKeyboardButton("👤 My Account", callback_data="user_account"),
          InlineKeyboardButton("📢 Official Channel", url=CHANNEL_URL)],
+        [InlineKeyboardButton("🤖 Create Your Own File Share Bot", callback_data="network_create"),
+         InlineKeyboardButton("🗂 My Bots", callback_data="network_mybots")],
     ]
     if _is_admin(user.id):
         btn.append([InlineKeyboardButton("👑 Admin Dashboard", callback_data="user_admin")])
@@ -515,14 +531,67 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await _is_manager(q.from_user.id):
             await _edit_callback_message(
                 q,
-                "🛠 <b>AdminGG Upload Panel</b>\n\n"
-                "Send a document, photo, video, or audio here. "
-                "I'll save it and return a shareable link.\n\n"
-                "<i>AdminGG accounts can only upload files and generate links.</i>",
-                InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")]])
+                "🛠 <b>AdminGG Manager Panel</b>\n\n"
+                "Send a document, photo, video, or audio here to save it and get a shareable link.\n\n"
+                "You can also view usage statistics and the auto-delete setting.",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 Users & Files Stats", callback_data="mg_stats")],
+                    [InlineKeyboardButton("⏳ Auto Delete", callback_data="mg_autodel")],
+                    [InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")],
+                ])
             )
         else:
             await q.answer("AdminGG access is for approved managers only.", show_alert=True)
+    elif q.data == "mg_stats":
+        if not await _is_manager(q.from_user.id):
+            await q.answer("Manager access only.", show_alert=True)
+            return
+        text = (
+            "📊 <b>AdminGG Usage Stats</b>\n\n"
+            f"👥 Users: <b>{await db_user_count()}</b>\n"
+            f"📦 Files: <b>{await db_file_count()}</b>\n"
+            f"🔑 Active keys: <b>{await db_active_key_count()}</b>"
+        )
+        await _edit_callback_message(q, text, InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data="mg_stats")],
+            [InlineKeyboardButton("⬅️ AdminGG Panel", callback_data="user_manager")],
+        ]))
+    elif q.data == "mg_autodel":
+        if not await _is_manager(q.from_user.id):
+            await q.answer("Manager access only.", show_alert=True)
+            return
+        seconds = await db_get_auto_del()
+        text = (
+            "⏳ <b>Auto Delete Settings</b>\n\n"
+            f"Current auto-delete time: <b>{_fmt_del(seconds)}</b> ({seconds}s)\n\n"
+            "Choose a duration below to update it. Minimum: 30 seconds."
+        )
+        await _edit_callback_message(q, text, InlineKeyboardMarkup([
+            [InlineKeyboardButton("5 minutes", callback_data="mg_setdel_300"), InlineKeyboardButton("10 minutes", callback_data="mg_setdel_600")],
+            [InlineKeyboardButton("1 hour", callback_data="mg_setdel_3600"), InlineKeyboardButton("24 hours", callback_data="mg_setdel_86400")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="mg_autodel")],
+            [InlineKeyboardButton("⬅️ AdminGG Panel", callback_data="user_manager")],
+        ]))
+    elif q.data.startswith("mg_setdel_"):
+        if not await _is_manager(q.from_user.id):
+            await q.answer("Manager access only.", show_alert=True)
+            return
+        try:
+            seconds = int(q.data.rsplit("_", 1)[1])
+            if seconds < 30:
+                raise ValueError
+            await db_set_setting("auto_del", seconds)
+            await q.answer(f"Auto-delete set to {_fmt_del(seconds)}")
+        except ValueError:
+            await q.answer("Invalid duration.", show_alert=True)
+            return
+        # Re-render the settings screen with the new value.
+        text = f"⏳ <b>Auto Delete Settings</b>\n\nCurrent auto-delete time: <b>{_fmt_del(seconds)}</b> ({seconds}s)\n\nChoose a duration below."
+        await _edit_callback_message(q, text, InlineKeyboardMarkup([
+            [InlineKeyboardButton("5 minutes", callback_data="mg_setdel_300"), InlineKeyboardButton("10 minutes", callback_data="mg_setdel_600")],
+            [InlineKeyboardButton("1 hour", callback_data="mg_setdel_3600"), InlineKeyboardButton("24 hours", callback_data="mg_setdel_86400")],
+            [InlineKeyboardButton("⬅️ AdminGG Panel", callback_data="user_manager")],
+        ]))
     elif q.data == "user_help":
         text = (
             f"✨ <b>How {BOT_NAME} works</b>\n\n"
@@ -557,6 +626,8 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("📖 How It Works", callback_data="user_help")],
             [InlineKeyboardButton("👤 My Account", callback_data="user_account"),
              InlineKeyboardButton("📢 Official Channel", url=CHANNEL_URL)],
+            [InlineKeyboardButton("🤖 Create Your Own Bot", callback_data="network_create"),
+             InlineKeyboardButton("🗂 My Bots", callback_data="network_mybots")],
         ]
         if _is_admin(q.from_user.id):
             rows.append([InlineKeyboardButton("👑 Admin Dashboard", callback_data="user_admin")])
@@ -724,10 +795,17 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = await db_user_count()
     files = await db_file_count()
     manager_count = await managers_col.count_documents({})
+    active_keys = await db_active_key_count()
+    custom_bot_count = await network_bots_col.count_documents({})
+    custom_bot_owners = len(await network_bots_col.distinct("owner_id"))
+    running_custom_bots = await network_bots_col.count_documents({"status": "running"})
     text = (
         f"👑 <b>{BOT_NAME} Control Center</b>\n"
         "<i>Manage your bot from one place.</i>\n\n"
         f"👥 <b>{users}</b> users     📦 <b>{files}</b> files\n"
+        f"🔑 <b>{active_keys}</b> active keys\n"
+        f"🤖 <b>{custom_bot_owners}</b> custom-bot users     🧩 <b>{custom_bot_count}</b> custom bots\n"
+        f"🟢 <b>{running_custom_bots}</b> running custom bots\n"
         f"🔒 <b>{len(fsub)}</b> force-sub channels     ⏳ <b>{_fmt_del(auto_del)}</b> auto-delete\n"
         f"🛠 <b>{manager_count}</b> AdminGG managers\n\n"
         "Select a management section:"
@@ -820,6 +898,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 <b>Stats</b>\n\n"
             f"👥 Users: <b>{await db_user_count()}</b>\n"
             f"📦 Files: <b>{await db_file_count()}</b>\n"
+            f"🔑 Active Keys: <b>{await db_active_key_count()}</b>\n"
+            f"🤖 Custom-Bot Users: <b>{len(await network_bots_col.distinct('owner_id'))}</b>\n"
+            f"🧩 Total Custom Bots: <b>{await network_bots_col.count_documents({})}</b>\n"
+            f"🟢 Running Custom Bots: <b>{await network_bots_col.count_documents({'status': 'running'})}</b>\n"
             f"🔒 FSub: <b>{len(await db_get_fsub())}</b>\n"
             f"⏳ Auto Del: <b>{_fmt_del(await db_get_auto_del())}</b>"
         )
@@ -1240,7 +1322,7 @@ async def cmd_mongo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_setautodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id): return
+    if not await _can_upload(update.effective_user.id): return
     if not context.args:
         await update.message.reply_text("Usage: /setautodel <seconds>")
         return
@@ -1354,10 +1436,11 @@ async def cmd_delfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update, context):
     err = context.error
-    logging.error(f"Update {update} caused error: {err}", exc_info=context.error)
+    logging.error("Update processing failed (%s)", type(err).__name__, exc_info=context.error)
 
 
 async def post_init(app):
+    await startup_network_bots()
     await app.bot.set_my_commands([
         BotCommand("start", "Open the Gudu Gaming main menu"),
         BotCommand("help", "Show available commands"),
@@ -1367,21 +1450,31 @@ async def post_init(app):
     ])
 
 
+async def post_shutdown(app):
+    await shutdown_network_bots()
+
+
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
 
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CommandHandler("getkey", getkey_handler))
     app.add_handler(CommandHandler("mykey", mykey_handler))
     app.add_handler(CommandHandler("resetkey", resetkey_handler))
-    app.add_handler(CallbackQueryHandler(user_callback, pattern="^(user_|key_|fsub_verify:)"))
+    app.add_handler(CallbackQueryHandler(user_callback, pattern="^(user_|key_|mg_|fsub_verify:)"))
+    app.add_handler(CallbackQueryHandler(network_callback, pattern=r"^network_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, network_text_message), group=0)
+    app.add_handler(CommandHandler("cancel", network_cancel))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("addmanager", cmd_addmanager))
     app.add_handler(CommandHandler("removemanager", cmd_removemanager))
     app.add_handler(CommandHandler("listmanagers", cmd_listmanagers))
     app.add_handler(CommandHandler("mongo", cmd_mongo))
     app.add_handler(CommandHandler("testfsub", cmd_testfsub))
+    app.add_handler(CommandHandler("networkfsubadd", cmd_network_fsub_add))
+    app.add_handler(CommandHandler("networkfsubremove", cmd_network_fsub_remove))
+    app.add_handler(CommandHandler("networkfsublist", cmd_network_fsub_list))
     app.add_handler(CommandHandler("addfsub", cmd_addfsub))
     app.add_handler(CommandHandler("setfsublink", cmd_setfsublink))
     app.add_handler(CommandHandler("removefsub", cmd_removefsub))
