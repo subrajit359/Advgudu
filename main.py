@@ -249,41 +249,60 @@ async def getkey_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _issue_free_key(update, context)
 
 
+def _key_info_text(doc, uid, notice=None):
+    created = doc["created_at"].strftime("%Y-%m-%d")
+    expires = doc["expires_at"].strftime("%Y-%m-%d %H:%M UTC")
+    devices = len(doc.get("devices", []))
+    prefix = f"{notice}\n\n" if notice else ""
+    return (
+        prefix + "✅ <b>Active</b>\n\n🔑 <b>Key Info</b>\n\n"
+        f"🗝 Key: <code>{doc['key']}</code>\n"
+        f"📋 Type: {doc.get('type', 'FREE')}\n"
+        f"⏰ Expires: {expires}\n"
+        f"📱 Devices: {devices}/{doc.get('device_limit', 1)}\n"
+        f"👤 UID: <code>{uid}</code>\n"
+        f"📅 Created: {created}\n"
+        "📊 Status: ✅ Active\n"
+        f"📝 Note: {doc.get('note', '-')}"
+    )
+
+
+def _no_key_markup():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Get Free Key", callback_data="key_get")]])
+
+
 async def mykey_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     doc = await _get_user_key(user.id)
     if not doc:
         await update.effective_message.reply_text(
-            "You don't have an active key yet. Use /getkey to generate one.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Get Free Key", callback_data="key_get")]])
+            "❌ You have no Key\nUse /getkey to get one free",
+            reply_markup=_no_key_markup(),
         )
         return
-    created = doc["created_at"].strftime("%Y-%m-%d")
-    expires = doc["expires_at"].strftime("%Y-%m-%d %H:%M UTC")
-    devices = len(doc.get("devices", []))
-    text = (
-        "✅ <b>Active</b>\n\n🔑 <b>Key Info</b>\n\n"
-        f"🗝 Key: <code>{doc['key']}</code>\n"
-        f"📋 Type: {doc.get('type', 'FREE')}\n"
-        f"⏰ Expires: {expires}\n"
-        f"📱 Devices: {devices}/{doc.get('device_limit', 1)}\n"
-        f"👤 UID: <code>{user.id}</code>\n"
-        f"📅 Created: {created}\n"
-        "📊 Status: ✅ Active\n"
-        f"📝 Note: {doc.get('note', '-')}"
+    await update.effective_message.reply_text(
+        _key_info_text(doc, user.id), parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑 Delete Key", callback_data="key_delete"),
+            InlineKeyboardButton("🔄 Reset Devices", callback_data="key_reset"),
+        ]]),
     )
-    await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑 Delete Key", callback_data="key_delete"), InlineKeyboardButton("🔄 Reset Devices", callback_data="key_reset")]
-    ]))
 
 
 async def resetkey_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = await _get_user_key(update.effective_user.id)
     if not doc:
-        await update.effective_message.reply_text("No active key found. Use /getkey first.")
+        await update.effective_message.reply_text(
+            "❌ You have no Key\nUse /getkey to get one free", reply_markup=_no_key_markup()
+        )
         return
-    await keys_col.update_one({"_id": doc["_id"]}, {"$set": {"devices": []}})
-    await update.effective_message.reply_text("🔄 Device list reset. Your active key can now be used on its allowed device.")
+    await update.effective_message.reply_text(
+        f"⚠️ Confirm Reset Devices?\n\n<code>{doc['key']}</code>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm", callback_data="key_reset_yes"),
+            InlineKeyboardButton("❌ Cancel", callback_data="key_cancel"),
+        ]]),
+    )
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -371,7 +390,6 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await deliver_file(update, context, token)
         return
-    await q.answer()
     if q.data == "key_get":
         not_joined, errors = await check_fsub(q.from_user.id, context)
         if errors:
@@ -380,31 +398,70 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Join the required channel(s) first.", show_alert=True)
             await send_fsub(update, context, not_joined, "KEY", q.from_user.first_name)
         else:
-            await q.message.reply_text("🔑 Key Center\n\nGenerate your free 1-day key:")
+            await q.answer()
             await _issue_free_key(update, context)
     elif q.data == "key_my":
         doc = await _get_user_key(q.from_user.id)
         if not doc:
-            await _edit_callback_message(q, "You don't have an active key. Use /getkey to generate one.", InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Get Free Key", callback_data="key_get")], [InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")]]))
+            await q.answer()
+            await _edit_callback_message(q, "❌ You have no Key\nUse /getkey to get one free", _no_key_markup())
         else:
-            created = doc["created_at"].strftime("%Y-%m-%d")
-            expires = doc["expires_at"].strftime("%Y-%m-%d %H:%M UTC")
-            text = ("✅ <b>Active</b>\n\n🔑 <b>Key Info</b>\n\n"
-                    f"🗝 Key: <code>{doc['key']}</code>\n📋 Type: FREE\n⏰ Expires: {expires}\n"
-                    f"📱 Devices: {len(doc.get('devices', []))}/1\n👤 UID: <code>{q.from_user.id}</code>\n"
-                    f"📅 Created: {created}\n📊 Status: ✅ Active\n📝 Note: -")
-            await _edit_callback_message(q, text, InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Delete Key", callback_data="key_delete"), InlineKeyboardButton("🔄 Reset Devices", callback_data="key_reset")], [InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")]]))
+            await q.answer()
+            await _edit_callback_message(q, _key_info_text(doc, q.from_user.id), InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Delete Key", callback_data="key_delete"), InlineKeyboardButton("🔄 Reset Devices", callback_data="key_reset")]
+            ]))
     elif q.data == "key_delete":
-        result = await keys_col.update_one({"user_id": q.from_user.id, "revoked": {"$ne": True}}, {"$set": {"revoked": True, "status": "deleted", "deleted_at": _utcnow()}})
-        await _edit_callback_message(q, "🗑 Your key has been deleted and deactivated. You can generate a new key using /getkey.", InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Generate New Key", callback_data="key_get")], [InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")]]))
+        doc = await _get_user_key(q.from_user.id)
+        if not doc:
+            await q.answer()
+            await _edit_callback_message(q, "❌ You have no Key\nUse /getkey to get one free", _no_key_markup())
+        else:
+            await q.answer()
+            await _edit_callback_message(q, f"⚠️ Confirm delete key?\n\n<code>{doc['key']}</code>", InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data="key_cancel"),
+                InlineKeyboardButton("✅ Confirm", callback_data="key_delete_yes"),
+            ]]))
+    elif q.data == "key_delete_yes":
+        doc = await _get_user_key(q.from_user.id)
+        if not doc:
+            await q.answer("No active key found.", show_alert=True)
+            await _edit_callback_message(q, "❌ You have no Key\nUse /getkey to get one free", _no_key_markup())
+            return
+        await keys_col.update_one({"_id": doc["_id"], "user_id": q.from_user.id}, {"$set": {"revoked": True, "status": "deleted", "deleted_at": _utcnow()}})
+        await q.answer("Key deleted.")
+        await _edit_callback_message(q, "❌ You have no Key\nUse /getkey to get one free", _no_key_markup())
     elif q.data == "key_reset":
         doc = await _get_user_key(q.from_user.id)
         if not doc:
-            await _edit_callback_message(q, "No active key found. Use /getkey.")
+            await q.answer()
+            await _edit_callback_message(q, "❌ You have no Key\nUse /getkey to get one free", _no_key_markup())
         else:
-            await keys_col.update_one({"_id": doc["_id"]}, {"$set": {"devices": []}})
-            await q.answer("Device list reset.", show_alert=True)
-            await mykey_handler(update, context)
+            await q.answer()
+            await _edit_callback_message(q, f"⚠️ Confirm Reset Devices?\n\n<code>{doc['key']}</code>", InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Confirm", callback_data="key_reset_yes"),
+                InlineKeyboardButton("❌ Cancel", callback_data="key_cancel"),
+            ]]))
+    elif q.data == "key_reset_yes":
+        doc = await _get_user_key(q.from_user.id)
+        if not doc:
+            await q.answer("No active key found.", show_alert=True)
+            await _edit_callback_message(q, "❌ You have no Key\nUse /getkey to get one free", _no_key_markup())
+            return
+        await keys_col.update_one({"_id": doc["_id"], "user_id": q.from_user.id}, {"$set": {"devices": []}})
+        doc["devices"] = []
+        await q.answer("Devices reset!")
+        await _edit_callback_message(q, _key_info_text(doc, q.from_user.id, "✅ Devices Reset"), InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Delete Key", callback_data="key_delete"), InlineKeyboardButton("🔄 Reset Devices", callback_data="key_reset")]
+        ]))
+    elif q.data == "key_cancel":
+        await q.answer("Cancelled.")
+        doc = await _get_user_key(q.from_user.id)
+        if doc:
+            await _edit_callback_message(q, _key_info_text(doc, q.from_user.id), InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Delete Key", callback_data="key_delete"), InlineKeyboardButton("🔄 Reset Devices", callback_data="key_reset")]
+            ]))
+        else:
+            await _edit_callback_message(q, "❌ You have no Key\nUse /getkey to get one free", _no_key_markup())
     elif q.data == "user_getfile":
         text = (
             "🔗 <b>Get a file with Gudu Gaming</b>\n\n"
@@ -490,12 +547,20 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_fsub(update, context, channels, token, first_name):
-    msg = (
-        f"🔐 <b>One quick step, {first_name}!</b>\n\n"
-        "To unlock this file, please join the channel(s) below.\n"
-        "Once you've joined all of them, tap <b>Verify Membership</b>.\n\n"
-        "<i>Any issue? Contact • @subro98 / @gudugaming8069</i>"
-    )
+    if token == "KEY":
+        msg = (
+            "🔑 <b>Get Free Key</b>\n\n"
+            "📊 <b>Progress:</b>\n"
+            "📌 Join all channels...\n\n"
+            "👇 Tap below to unlock"
+        )
+    else:
+        msg = (
+            f"🔐 <b>One quick step, {first_name}!</b>\n\n"
+            "To unlock this file, please join the channel(s) below.\n"
+            "Once you've joined all of them, tap <b>Verify Membership</b>.\n\n"
+            "<i>Any issue? Contact • @subro98 / @gudugaming8069</i>"
+        )
     btns = []
     for ch in channels:
         invite = ch.get("invite_link")

@@ -216,3 +216,14 @@ The bot owner (`OWNER_ID`) can assign limited upload managers:
 - `/listmanagers` — list current managers.
 
 Managers see an **AdminGG** button and can upload supported documents, photos, videos, and audio. The bot stores each upload and returns its share link. Managers cannot access the owner dashboard, change settings, manage force-sub channels, broadcast, ban users, or delete files. Manager assignments are stored in MongoDB and persist across redeployments.
+
+## Free key center
+
+- `/getkey` checks every configured force-sub channel before issuing a 1-day FREE key.
+- `/mykey` shows the exact Key Info layout and Delete Key / Reset Devices buttons.
+- Delete Key and Reset Devices both require an explicit confirmation.
+- Reset Devices clears the registered device list without changing the key or its expiry.
+- Expired, deleted, or missing keys show `❌ You have no Key` with a `🔑 Get Free Key` button.
+- The key force-sub prompt displays the Get Free Key progress message and per-channel join buttons, followed by Verify Membership.
+
+The bot must be an administrator in each force-sub channel so Telegram can verify membership. Configure channels with `/addfsub`.
