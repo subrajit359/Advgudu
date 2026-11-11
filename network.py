@@ -1029,9 +1029,8 @@ async def handle_network_token(update: Update, context: ContextTypes.DEFAULT_TYP
         me = await candidate.get_me()
         if not me.is_bot or not me.username:
             raise ValueError("Token does not identify a bot")
-        # Step 3 is deliberately deferred: the user first submits the bot username
-        # to this bot. A configured verifier can then collect it from the queue and
-        # manually add the customer bot to the storage channel.
+        # The bot username is obtained from Telegram and submitted to the
+        # verification queue when the user presses the Submit button.
         existing = await bots_col.find_one({"_id": me.id})
         if existing and int(existing.get("owner_id", 0)) != uid:
             await update.message.reply_text("❌ This bot is already registered to another Gudu Gaming account.")
@@ -1052,10 +1051,8 @@ async def handle_network_token(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["network_pending_submit_bot"] = me.id
         await update.message.reply_text(
             f"✅ Token verified!\n\n🤖 Bot: @{me.username}\n\n"
-            "Next, submit this bot username to the Gudu Gaming verification queue. "
-            "A verifier will collect it here and manually add your bot to the storage channel. "
-            "No personal message to a verifier is needed.\n\n"
-            "Tap the button, then send the bot username exactly as shown.",
+            "Tap the button below to automatically submit this bot to the Gudu Gaming verification queue. "
+            "You do not need to type or send the username manually. A verifier will collect it and add your bot to the storage channel.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📩 Submit bot username", callback_data=f"network_submitbot_{me.id}")]])
         )
     except Exception as exc:
@@ -1101,9 +1098,30 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         pending = await bots_col.find_one({"_id": bot_id, "owner_id": uid, "status": "pending_verification"})
         if not pending:
+            await q.message.reply_text("❌ This bot registration could not be found. Please start the bot connection process again.")
             return
-        context.user_data["network_await_submit_username"] = bot_id
-        await q.message.reply_text(f"Send the username of your bot now: @{pending['username']}\n\nSend it as @username. Send /cancel to stop.")
+
+        # The username was obtained directly from Telegram get_me() when the
+        # token was verified, so the button itself can safely submit it.
+        await verification_requests_col.update_one(
+            {"_id": bot_id},
+            {"$set": {
+                "owner_id": uid,
+                "username": pending["username"],
+                "status": "pending",
+                "submitted": True,
+                "submitted_at": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+        context.user_data.pop("network_await_submit_username", None)
+        context.user_data.pop("network_pending_submit_bot", None)
+        await q.message.reply_text(
+            f"✅ @{pending['username']} was automatically added to the verification queue.\n\n"
+            "No username message is needed. A verifier will collect the request and add your bot to the storage channel. "
+            "After they finish, tap Continue Verification below.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Continue Verification", callback_data=f"network_continueverify_{bot_id}")]])
+        )
     elif data.startswith("network_continueverify_"):
         try:
             bot_id = int(data.rsplit("_", 1)[1])
