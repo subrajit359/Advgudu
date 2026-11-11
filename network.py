@@ -395,8 +395,15 @@ async def _bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = []
     if doc.get("channel_url"):
         rows.append([InlineKeyboardButton(doc.get("channel_button") or "📢 My Channel", url=doc["channel_url"])])
-    if user.id == int(doc["owner_id"]):
+
+    # A member-appointed manager must see the same Control Center entry point
+    # when opening the customer bot. Authorization is still checked again by
+    # cmd_bot_panel and _bot_panel_callback against this bot's manager record.
+    is_owner = user.id == int(doc["owner_id"])
+    is_manager = await _is_bot_manager(context.bot.id, user.id)
+    if is_owner or is_manager:
         rows.append([InlineKeyboardButton("🎛 Control Center", callback_data="netpanel:home")])
+    if is_owner:
         rows.append([InlineKeyboardButton("👤 My Account", callback_data="netaccount")])
     await update.effective_message.reply_text(welcome, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
 
