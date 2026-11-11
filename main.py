@@ -385,6 +385,20 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode="HTML", reply_markup=markup)
 
 
+async def _prompt_network_create(message, context):
+    context.user_data["network_await_token"] = True
+    await message.reply_text(
+        "🤖 Connect Your Telegram Bot\n\n"
+        "Step 1: Open @BotFather.\n"
+        "Step 2: Send /newbot and follow the instructions.\n"
+        "Step 3: Choose a name and username for your bot.\n"
+        "Step 4: Copy the API token provided by BotFather.\n"
+        "Step 5: Send the token here to complete setup.\n\n"
+        "🔒 Never share your bot token with anyone else.\n"
+        "❌ Send /cancel to stop."
+    )
+
+
 async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
@@ -407,6 +421,14 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("You haven't joined all required channels yet. Join them and try again.", show_alert=True)
             await send_fsub(update, context, not_joined, token, q.from_user.first_name)
             return
+        if token == "NETWORK_CREATE":
+            await q.answer("Membership verified! You can now create your bot.")
+            try:
+                await q.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await _prompt_network_create(q.message, context)
+            return
         if token == "KEY":
             await q.answer("Membership verified! Generating your key…")
             await _issue_free_key(update, context)
@@ -417,6 +439,24 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         await deliver_file(update, context, token)
+        return
+    if q.data == "network_create":
+        required_channels = await db_get_fsub()
+        if not required_channels:
+            await q.answer("Bot creation is temporarily unavailable.", show_alert=True)
+            await q.message.reply_text("⚠️ Bot creation requires the administrator to configure the Main Bot Force Subscribe channel list first.")
+            return
+        not_joined, errors = await check_fsub(q.from_user.id, context)
+        if errors:
+            await q.answer("Membership check unavailable. Please try again later.", show_alert=True)
+            await q.message.reply_text("⚠️ I couldn't verify membership. The main bot must be an administrator in every Force Subscribe channel.")
+            return
+        if not_joined:
+            await q.answer("Join all required channels to create your bot.", show_alert=True)
+            await send_fsub(update, context, not_joined, "NETWORK_CREATE", q.from_user.first_name)
+            return
+        await q.answer("Membership verified!")
+        await _prompt_network_create(q.message, context)
         return
     if not q.data.startswith("key_"):
         await q.answer()
@@ -659,6 +699,12 @@ async def send_fsub(update, context, channels, token, first_name):
             "📊 <b>Progress:</b>\n"
             "📌 Join all channels...\n\n"
             "👇 Tap below to unlock"
+        )
+    elif token == "NETWORK_CREATE":
+        msg = (
+            f"🤖 <b>Create Your Own File Share Bot, {first_name}!</b>\n\n"
+            "To use this feature, join every official Force Subscribe channel below.\n"
+            "After joining all channels, tap <b>Verify Membership</b> to continue bot creation."
         )
     else:
         msg = (
@@ -1559,7 +1605,7 @@ def main():
     app.add_handler(CommandHandler("getkey", getkey_handler))
     app.add_handler(CommandHandler("mykey", mykey_handler))
     app.add_handler(CommandHandler("resetkey", resetkey_handler))
-    app.add_handler(CallbackQueryHandler(user_callback, pattern="^(user_|key_|mg_|fsub_verify:)"))
+    app.add_handler(CallbackQueryHandler(user_callback, pattern="^(user_|key_|mg_|fsub_verify:|network_create$)"))
     app.add_handler(CallbackQueryHandler(network_callback, pattern=r"^network_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, network_text_message), group=0)
     app.add_handler(CommandHandler("cancel", network_cancel))
