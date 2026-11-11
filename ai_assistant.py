@@ -4,6 +4,7 @@ The model can suggest only allow-listed actions. The calling bot must perform
 all authorization checks and action execution locally.
 """
 import json
+import logging
 import os
 import re
 import time
@@ -55,22 +56,74 @@ async def create_ai_plan(user_text, history, actions, role_label, summary=""):
         if item.get("role") in ("user", "assistant"):
             messages.append({"role": item["role"], "content": _clean_text(item.get("content"), 2000)})
     messages.append({"role": "user", "content": _clean_text(user_text, 2000)})
+    # GPT-OSS supports Groq Structured Outputs.  Use strict JSON schema first
+    # so the bot receives a predictable object.  If a deployment/model rejects
+    # structured output, retry once with JSON-object mode.  Never expose the API
+    # key or full request contents in logs.
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "reply": {"type": "string"},
+            "action": {
+                "anyOf": [
+                    {"type": "null"},
+                    {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "args": {"type": "object", "additionalProperties": True},
+                        },
+                        "required": ["name", "args"],
+                        "additionalProperties": False,
+                    },
+                ]
+            },
+        },
+        "required": ["reply", "action"],
+        "additionalProperties": False,
+    }
     payload = {
         "model": AI_MODEL,
         "messages": messages,
         "temperature": 0.2,
-        "response_format": {"type": "json_object"},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "gudu_ai_plan",
+                "strict": True,
+                "schema": response_schema,
+            },
+        },
     }
+    headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
     timeout = httpx.Timeout(35.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            f"{AI_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
-            json=payload,
-        )
-        response.raise_for_status()
+        response = await client.post(f"{AI_BASE_URL}/chat/completions", headers=headers, json=payload)
+        if response.status_code == 400:
+            # Some model aliases/deployments may not accept strict structured
+            # output. Fall back to the older JSON mode without hiding the real
+            # provider error from server logs.
+            try:
+                err = response.json().get("error", {})
+                logging_msg = err.get("message") or err.get("type") or response.text[:500]
+            except Exception:
+                logging_msg = response.text[:500]
+            logging.warning("Groq rejected structured Gudu AI request (400): %s", _clean_text(logging_msg, 500))
+            payload["response_format"] = {"type": "json_object"}
+            response = await client.post(f"{AI_BASE_URL}/chat/completions", headers=headers, json=payload)
+        if response.is_error:
+            try:
+                err = response.json().get("error", {})
+                detail = err.get("message") or err.get("type") or response.text[:500]
+            except Exception:
+                detail = response.text[:500]
+            logging.error("Groq Gudu AI request failed: HTTP %s: %s", response.status_code, _clean_text(detail, 500))
+            response.raise_for_status()
         data = response.json()
     content = data["choices"][0]["message"]["content"]
+    content = str(content or "").strip()
+    if content.startswith("```"):
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.IGNORECASE | re.DOTALL).strip()
     plan = json.loads(content)
     if not isinstance(plan, dict):
         raise ValueError("Invalid AI response")

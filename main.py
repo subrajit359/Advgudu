@@ -1835,6 +1835,7 @@ async def main_ai_start(update, context):
     context.user_data.pop("gudu_ai_pending_at", None)
     context.user_data.pop("gudu_ai_summary", None)
     context.user_data.pop("gudu_ai_history", None)
+    context.user_data.pop("gudu_ai_language", None)
     await update.effective_message.reply_text("🤖 Gudu AI is ready. Tell me what you need in natural language.\nUse /aistop to leave AI chat. Sensitive actions require confirmation.")
 
 async def main_ai_stop(update, context):
@@ -1946,24 +1947,89 @@ def _main_ai_confirmation_summary(action):
     if name in ("add_force_subscribe", "remove_force_subscribe"): return f"Channel ID: {args.get('channel_id', 'not provided')}"
     return "Please review the requested change before confirming."
 
+
+async def _gudu_ai_countdown(message, seconds=5):
+    """Show a per-message 5-second countdown while AI work runs in parallel."""
+    try:
+        timer = await message.reply_text(f"🤖 Gudu AI will join in {seconds}s…")
+        for remaining in range(seconds - 1, 0, -1):
+            await asyncio.sleep(1)
+            try:
+                await timer.edit_text(f"🤖 Gudu AI will join in {remaining}s…")
+            except Exception:
+                return timer
+        await asyncio.sleep(1)
+        try:
+            await timer.edit_text("🤖 Gudu AI is processing your message…")
+        except Exception:
+            pass
+        return timer
+    except Exception:
+        logging.exception("Gudu AI countdown failed")
+        return None
+
+
+async def _gudu_ai_replace_timer(timer, message, text, reply_markup=None):
+    """Replace the countdown with the actual result, or send a fallback reply."""
+    if timer:
+        try:
+            await timer.edit_text(text, reply_markup=reply_markup)
+            return
+        except Exception:
+            pass
+    await message.reply_text(text, reply_markup=reply_markup)
+
+
 async def main_ai_message(update, context):
     if not context.user_data.get("gudu_ai_enabled") or not update.effective_message or not update.effective_user: return
     if any(context.user_data.get(k) for k in ("network_action", "network_await_submit_username", "network_await_token", "netpanel_action")): return
+
+    text = (update.effective_message.text or "").strip()
+    lower = text.lower()
+
+    # Every message in an active Gudu AI session gets its own 5-second timer.
+    # The AI request starts immediately in parallel, so this is UX only and
+    # is separate from the backend rate limiter.
+    countdown_task = asyncio.create_task(_gudu_ai_countdown(update.effective_message, 5))
+
     if context.user_data.get("gudu_ai_pending"):
         if time.time() - context.user_data.get("gudu_ai_pending_at", 0) > 300:
             context.user_data.pop("gudu_ai_pending", None); context.user_data.pop("gudu_ai_pending_at", None)
         else:
-            await update.effective_message.reply_text("Please confirm or cancel the pending action before sending another request."); return
+            timer = await countdown_task
+            await _gudu_ai_replace_timer(timer, update.effective_message, "Please confirm or cancel the pending action before sending another request.")
+            return
+
+    # Language preference is a conversation setting, not an admin action.
+    if lower in {"hinglish me", "hinglish mein", "hinglish mein bolo", "hinglish me bolo"}:
+        context.user_data["gudu_ai_language"] = "hinglish"
+        timer = await countdown_task
+        await _gudu_ai_replace_timer(timer, update.effective_message, "Bilkul 👍 Ab main Hinglish mein baat karunga.")
+        return
+    if lower in {"english me", "english mein", "english mein bolo", "english me bolo"}:
+        context.user_data["gudu_ai_language"] = "english"
+        timer = await countdown_task
+        await _gudu_ai_replace_timer(timer, update.effective_message, "Sure 👍 I’ll continue in English.")
+        return
+    if lower in {"english alphabet mein bolo", "english alphabet me bolo", "roman hindi mein bolo", "roman hindi me bolo"}:
+        context.user_data["gudu_ai_language"] = "roman_hindi"
+        timer = await countdown_task
+        await _gudu_ai_replace_timer(timer, update.effective_message, "Bilkul 👍 Ab Hindi ko English/Roman letters mein likhunga.")
+        return
+
     if rate_limited(context.user_data):
-        await update.effective_message.reply_text("You're sending requests too quickly. Please wait a minute and try again."); return
+        timer = await countdown_task
+        await _gudu_ai_replace_timer(timer, update.effective_message, "You’re sending requests too quickly. Please wait a minute and try again.")
+        return
+
     uid = update.effective_user.id
     actions = await _main_ai_allowed_actions(uid)
     role = "Super Admin" if _is_admin(uid) else "AdminGG manager" if await _is_manager(uid) else "user"
+    language = context.user_data.get("gudu_ai_language")
+    if language:
+        role = f"{role}; conversation language preference={language}"
     history = context.user_data.setdefault("gudu_ai_history", [])
     summary = context.user_data.get("gudu_ai_summary", "")
-    # Compact older turns before the active history grows too large. If the
-    # provider is unavailable for summarization, keep the session usable by
-    # trimming to the configured recent-turn window.
     if len(history) >= AI_HISTORY_SUMMARIZE_AT:
         try:
             new_summary = await summarize_ai_history(history)
@@ -1974,28 +2040,46 @@ async def main_ai_message(update, context):
             logging.exception("Gudu AI session summarization failed")
         history = history[-AI_HISTORY_KEEP:]
         context.user_data["gudu_ai_history"] = history
+
     try:
-        plan = await create_ai_plan(update.effective_message.text or "", history, actions, role, summary)
+        # This starts immediately; the countdown is running concurrently.
+        plan = await create_ai_plan(text, history, actions, role, summary)
     except RuntimeError as exc:
-        if str(exc) == "AI_NOT_CONFIGURED": await update.effective_message.reply_text("AI is not configured yet. Please contact the bot owner."); return
-        await update.effective_message.reply_text("AI is temporarily unavailable. Please try again later."); return
+        timer = await countdown_task
+        msg = "AI is not configured yet. Please contact the bot owner." if str(exc) == "AI_NOT_CONFIGURED" else "AI is temporarily unavailable. Please try again later."
+        await _gudu_ai_replace_timer(timer, update.effective_message, msg)
+        return
     except Exception:
         logging.exception("Gudu AI request failed")
-        await update.effective_message.reply_text("AI is temporarily unavailable. Please try again later."); return
-    history.extend([{"role": "user", "content": update.effective_message.text or ""}, {"role": "assistant", "content": plan["reply"]}])
+        timer = await countdown_task
+        await _gudu_ai_replace_timer(timer, update.effective_message, "AI is temporarily unavailable. Please try again later.")
+        return
+
+    history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": plan["reply"]}])
     context.user_data["gudu_ai_history"] = history[-AI_HISTORY_KEEP:]
     action = plan.get("action")
+    timer = await countdown_task
+
     if not action:
-        await update.effective_message.reply_text(plan["reply"] or "How can I help?"); return
+        await _gudu_ai_replace_timer(timer, update.effective_message, plan["reply"] or "How can I help?")
+        return
+
     if action["name"] in MAIN_AI_CONFIRM:
         context.user_data["gudu_ai_pending"] = action
         context.user_data["gudu_ai_pending_at"] = time.time()
         summary = _main_ai_confirmation_summary(action)
-        await update.effective_message.reply_text((plan["reply"] + "\n\n" + summary + "\n\nDo you want me to proceed?").strip(), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm", callback_data="gai:confirm"), InlineKeyboardButton("Cancel", callback_data="gai:cancel")]])); return
+        confirmation = (plan["reply"] + "\n\n" + summary + "\n\nDo you want me to proceed?").strip()
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm", callback_data="gai:confirm"), InlineKeyboardButton("Cancel", callback_data="gai:cancel")]])
+        await _gudu_ai_replace_timer(timer, update.effective_message, confirmation, markup)
+        return
+
     result = await _main_ai_execute(update, context, action)
     history.append({"role": "assistant", "content": result or "The requested action was completed."})
     context.user_data["gudu_ai_history"] = history[-AI_HISTORY_KEEP:]
-    if result: await update.effective_message.reply_text(result, parse_mode="HTML")
+    if result:
+        await _gudu_ai_replace_timer(timer, update.effective_message, result, None)
+    else:
+        await _gudu_ai_replace_timer(timer, update.effective_message, "Done.", None)
 
 async def main_ai_callback(update, context):
     q = update.callback_query
