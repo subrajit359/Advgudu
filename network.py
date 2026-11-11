@@ -5,6 +5,7 @@ channel. The customer bot must be an administrator of that channel. MongoDB
 stores metadata only; file payloads stay in Telegram.
 """
 import asyncio
+import html
 import logging
 import os
 import re
@@ -35,6 +36,9 @@ network_settings_col = db["network_settings"]
 bot_managers_col = db["network_bot_managers"]
 bot_bans_col = db["network_bot_bans"]
 owner_fsub_col = db["network_owner_fsub"]
+# /fsub is the Main Bot owner-gating list; /fsubmem is global_fsub_col.
+main_fsub_col = db["fsub_channels"]
+_owner_fsub_monitor_task = None
 
 _raw_storage_id = int(os.environ.get("NETWORK_STORAGE_CHANNEL_ID", "3959825660"))
 # Telegram channel IDs returned without the -100 prefix are normalized here.
@@ -122,8 +126,91 @@ async def _stop_runtime(bot_id):
         log.error("Failed stopping customer bot %s", bot_id)
 
 
+async def _check_owner_main_fsub(owner_id):
+    """Check the member-bot owner's subscription to Main Bot /fsub channels.
+
+    Returns (missing_channels, errors). An empty /fsub list imposes no owner gate.
+    """
+    missing, errors = [], []
+    channels = await main_fsub_col.find().to_list(None)
+    for channel in channels:
+        ch_id = channel.get("_id")
+        try:
+            member = await _main_bot.get_chat_member(chat_id=int(ch_id), user_id=int(owner_id))
+            status = _member_status_value(member)
+            if status in ("creator", "administrator", "member"):
+                continue
+            if status == "restricted" and bool(getattr(member, "is_member", False)):
+                continue
+            if status in ("left", "kicked") or status == "restricted":
+                missing.append(channel)
+                continue
+            raise ValueError(f"Unexpected membership status: {status or 'empty'}")
+        except Exception as exc:
+            log.warning("Main /fsub owner check failed (channel=%s owner=%s): %s", ch_id, owner_id, exc)
+            errors.append(channel)
+    return missing, errors
+
+
+async def _owner_fsub_monitor():
+    """Suspend only the bots owned by people who leave a Main Bot /fsub channel."""
+    while True:
+        try:
+            async for doc in bots_col.find({"status": {"$nin": [
+                "pending_verification", "verification_failed", "stopped_by_admin", "stopped"
+            ]}}):
+                bot_id = int(doc["_id"])
+                owner_id = int(doc["owner_id"])
+                missing, errors = await _check_owner_main_fsub(owner_id)
+                if errors:
+                    # Telegram/API uncertainty must not falsely suspend a member.
+                    continue
+                if missing:
+                    if not doc.get("owner_fsub_blocked"):
+                        await _stop_runtime(bot_id)
+                        await bots_col.update_one({"_id": bot_id}, {"$set": {
+                            "status": "stopped_by_owner_fsub",
+                            "owner_fsub_blocked": True,
+                            "owner_fsub_checked_at": datetime.now(timezone.utc),
+                        }})
+                        log.info("Suspended member bot %s: owner left Main Bot /fsub", bot_id)
+                elif doc.get("owner_fsub_blocked") or doc.get("owner_fsub_check_error"):
+                    try:
+                        await bots_col.update_one({"_id": bot_id}, {"$set": {
+                            "status": "starting", "owner_fsub_blocked": False,
+                            "owner_fsub_check_error": False,
+                            "owner_fsub_checked_at": datetime.now(timezone.utc),
+                        }})
+                        fresh = await bots_col.find_one({"_id": bot_id})
+                        await _start_runtime(fresh)
+                        log.info("Reactivated member bot %s: owner rejoined Main Bot /fsub", bot_id)
+                    except Exception:
+                        log.exception("Could not restart member bot %s after owner rejoined /fsub", bot_id)
+                        await bots_col.update_one({"_id": bot_id}, {"$set": {"status": "error"}})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Member owner /fsub monitor iteration failed")
+        await asyncio.sleep(60)
+
+
 async def _start_runtime(doc):
     bot_id = int(doc["_id"])
+    if doc.get("status") == "stopped_by_admin":
+        return False
+    missing, errors = await _check_owner_main_fsub(int(doc["owner_id"]))
+    if errors:
+        await bots_col.update_one({"_id": bot_id}, {"$set": {
+            "status": "owner_fsub_check_error", "owner_fsub_check_error": True,
+        }})
+        return False
+    if missing:
+        await _stop_runtime(bot_id)
+        await bots_col.update_one({"_id": bot_id}, {"$set": {
+            "status": "stopped_by_owner_fsub", "owner_fsub_blocked": True,
+            "owner_fsub_checked_at": datetime.now(timezone.utc),
+        }})
+        return False
     async with _start_lock:
         if bot_id in _running:
             return True
@@ -140,6 +227,7 @@ async def _start_runtime(doc):
         app.add_handler(CommandHandler("ban", cmd_bot_ban))
         app.add_handler(CommandHandler("unban", cmd_bot_unban))
         app.add_handler(CommandHandler("addfjoin", cmd_bot_addfjoin))
+        app.add_handler(CommandHandler("addchannel", cmd_bot_addchannel))
         app.add_handler(CommandHandler("listfjoin", cmd_bot_listfjoin))
         app.add_handler(CommandHandler("removefjoin", cmd_bot_removefjoin))
         app.add_handler(CommandHandler("setwelcome", cmd_bot_setwelcome))
@@ -197,11 +285,16 @@ async def _start_runtime(doc):
                 log.exception("Failed to shut down application after startup failure for bot %s", bot_id)
             raise
         _running[bot_id] = app
-        await bots_col.update_one({"_id": bot_id}, {"$set": {"status": "running", "last_started_at": datetime.now(timezone.utc)}})
+        await bots_col.update_one({"_id": bot_id}, {"$set": {
+            "status": "running", "owner_fsub_blocked": False,
+            "owner_fsub_check_error": False,
+            "last_started_at": datetime.now(timezone.utc),
+        }})
         return True
 
 
 async def startup_network_bots():
+    global _owner_fsub_monitor_task
     try:
         await _main_bot.initialize()
     except Exception:
@@ -215,9 +308,19 @@ async def startup_network_bots():
         except Exception:
             log.error("Could not start customer bot %s (%s)", doc.get("_id"), "startup error")
             await bots_col.update_one({"_id": doc["_id"]}, {"$set": {"status": "error"}})
+    if _owner_fsub_monitor_task is None or _owner_fsub_monitor_task.done():
+        _owner_fsub_monitor_task = asyncio.create_task(_owner_fsub_monitor())
 
 
 async def shutdown_network_bots():
+    global _owner_fsub_monitor_task
+    if _owner_fsub_monitor_task and not _owner_fsub_monitor_task.done():
+        _owner_fsub_monitor_task.cancel()
+        try:
+            await _owner_fsub_monitor_task
+        except asyncio.CancelledError:
+            pass
+        _owner_fsub_monitor_task = None
     for bot_id in list(_running):
         await _stop_runtime(bot_id)
     try:
@@ -480,8 +583,8 @@ async def cmd_bot_ban(update, context):
     if not context.args or not context.args[0].isdigit():
         await update.effective_message.reply_text("Usage: /ban USER_ID"); return
     uid = int(context.args[0])
-    if uid == int(doc["owner_id"]):
-        await update.effective_message.reply_text("You cannot ban the bot owner."); return
+    if uid in await _bot_privileged_ids(context.bot.id, doc["owner_id"]):
+        await update.effective_message.reply_text("You cannot ban the bot owner or a manager."); return
     await bot_bans_col.update_one({"bot_id": int(context.bot.id), "user_id": uid}, {"$set": {"bot_id": int(context.bot.id), "user_id": uid, "banned_at": datetime.now(timezone.utc)}}, upsert=True)
     await update.effective_message.reply_text(f"🚫 User {uid} banned from this bot.")
 
@@ -494,7 +597,7 @@ async def cmd_bot_unban(update, context):
     await update.effective_message.reply_text("✅ User unbanned." if result.deleted_count else "User was not banned.")
 
 async def cmd_bot_addfjoin(update, context):
-    doc = await _is_bot_owner_or_manager(update, context, owner_only=True)
+    doc = await _is_bot_owner_or_manager(update, context, owner_only=False)
     if not doc: return
     if not context.args or not context.args[0].lstrip('-').isdigit():
         await update.effective_message.reply_text("Usage: /addfjoin CHANNEL_ID"); return
@@ -509,8 +612,52 @@ async def cmd_bot_addfjoin(update, context):
     except Exception:
         await update.effective_message.reply_text("❌ Cannot add channel. Make sure the main Gudu Gaming bot is an administrator there and send a valid channel ID.")
 
+async def cmd_bot_addchannel(update, context):
+    """Add a member-bot subscription channel with its explicit invitation URL.
+
+    Usage: /addchannel -1001234567890 https://t.me/+INVITATION_CODE
+    The channel is stored only against the current customer bot.
+    """
+    doc = await _is_bot_owner_or_manager(update, context, owner_only=False)
+    if not doc:
+        return
+    if len(context.args) != 2 or not context.args[0].lstrip("-").isdigit():
+        await update.effective_message.reply_text(
+            "Usage: /addchannel -100XXXXXXXXXX https://t.me/+INVITATION_CODE"
+        )
+        return
+    ch_id = int(context.args[0])
+    invite_link = context.args[1].strip()
+    if not re.match(r"^https?://t\.me/(?:\+[A-Za-z0-9_-]+|[A-Za-z0-9_]{5,})$", invite_link):
+        await update.effective_message.reply_text("Please provide a valid Telegram channel invitation link.")
+        return
+    try:
+        chat = await _main_bot.get_chat(ch_id)
+        member = await _main_bot.get_chat_member(ch_id, _main_bot.id)
+        if _member_status_value(member) not in ("administrator", "creator"):
+            raise ValueError("Main bot is not an administrator")
+        await owner_fsub_col.update_one(
+            {"bot_id": int(context.bot.id), "_id": ch_id},
+            {"$set": {
+                "bot_id": int(context.bot.id),
+                "owner_id": int(doc["owner_id"]),
+                "title": chat.title or str(ch_id),
+                "invite_link": invite_link,
+            }},
+            upsert=True,
+        )
+        await update.effective_message.reply_text(
+            f"✅ Added {chat.title or ch_id} to @{context.bot.username}'s subscription channels."
+        )
+    except Exception as exc:
+        log.warning("Could not add member-bot channel %s: %s", ch_id, type(exc).__name__)
+        await update.effective_message.reply_text(
+            "❌ Could not add this channel. Check the channel ID, invitation link, and that the main Gudu bot is an administrator."
+        )
+
+
 async def cmd_bot_listfjoin(update, context):
-    doc = await _is_bot_owner_or_manager(update, context, owner_only=True)
+    doc = await _is_bot_owner_or_manager(update, context, owner_only=False)
     if not doc: return
     own = await owner_fsub_col.find({"bot_id": int(context.bot.id)}).to_list(None)
     platform = await global_fsub_col.find().to_list(None)
@@ -521,7 +668,7 @@ async def cmd_bot_listfjoin(update, context):
     await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def cmd_bot_removefjoin(update, context):
-    doc = await _is_bot_owner_or_manager(update, context, owner_only=True)
+    doc = await _is_bot_owner_or_manager(update, context, owner_only=False)
     if not doc: return
     if not context.args or not context.args[0].lstrip('-').isdigit():
         await update.effective_message.reply_text("Usage: /removefjoin CHANNEL_ID"); return
@@ -558,7 +705,8 @@ async def cmd_bot_broadcast(update, context):
     body = " ".join(context.args).strip()
     if not source and not body:
         await update.effective_message.reply_text("Usage: /broadcast message (or reply to a media/message with /broadcast)"); return
-    targets = await users_col.find({"bot_id": int(context.bot.id)}, {"user_id": 1}).to_list(None)
+    privileged_ids = await _bot_privileged_ids(context.bot.id, doc["owner_id"])
+    targets = await users_col.find({"bot_id": int(context.bot.id), "user_id": {"$nin": privileged_ids}}, {"user_id": 1}).to_list(None)
     sent = failed = 0
     status = await update.effective_message.reply_text(f"📡 Broadcasting to {len(targets)} users...")
     for target in targets:
@@ -579,43 +727,63 @@ async def cmd_bot_myaccount(update, context):
         return
     owned = await bots_col.find({"owner_id": int(doc["owner_id"])}).to_list(None)
     bot_ids = [int(x["_id"]) for x in owned]
-    users = await users_col.count_documents({"bot_id": {"$in": bot_ids}}) if bot_ids else 0
+    users = downloads_total = 0
+    for owned_bot in owned:
+        bid = int(owned_bot["_id"])
+        normal_filter = await _normal_bot_user_filter(bid, owned_bot["owner_id"])
+        users += await users_col.count_documents(normal_filter)
+        per_bot_downloads = await users_col.aggregate([
+            {"$match": normal_filter},
+            {"$group": {"_id": None, "n": {"$sum": {"$ifNull": ["$downloads", 0]}}}},
+        ]).to_list(1)
+        downloads_total += per_bot_downloads[0]["n"] if per_bot_downloads else 0
     files = await files_col.count_documents({"bot_id": {"$in": bot_ids}, "owner_id": int(doc["owner_id"])}) if bot_ids else 0
     managers = await bot_managers_col.count_documents({"bot_id": {"$in": bot_ids}}) if bot_ids else 0
-    downloads = await users_col.aggregate([{"$match": {"bot_id": {"$in": bot_ids}}}, {"$group": {"_id": None, "n": {"$sum": "$downloads"}}}]).to_list(1) if bot_ids else []
+    downloads = [{"n": downloads_total}] if bot_ids else []
     await update.effective_message.reply_text(
         f"👤 <b>My Account — @{context.bot.username}</b>\n\n"
         f"📦 Files: <b>{files}</b>\n👥 Users: <b>{users}</b>\n📥 Downloads: <b>{downloads[0]['n'] if downloads else 0}</b>\n"
         f"🤖 Bots: <b>{len(bot_ids)}</b>\n🛠 Managers: <b>{managers}</b>", parse_mode="HTML")
 
-def _panel_home_markup():
-    return InlineKeyboardMarkup([
+def _panel_home_markup(is_owner=True):
+    rows = [
         [InlineKeyboardButton("📊 My Account", callback_data="netpanel:account"), InlineKeyboardButton("📁 Files", callback_data="netpanel:files")],
-        [InlineKeyboardButton("👥 Users", callback_data="netpanel:users"), InlineKeyboardButton("🛠 Managers", callback_data="netpanel:managers")],
+        [InlineKeyboardButton("👥 Users", callback_data="netpanel:users")],
         [InlineKeyboardButton("🔒 Force Join", callback_data="netpanel:fjoin"), InlineKeyboardButton("✏️ Welcome", callback_data="netpanel:welcome")],
         [InlineKeyboardButton("📢 My Channel", callback_data="netpanel:channel"), InlineKeyboardButton("📡 Broadcast", callback_data="netpanel:broadcast")],
-    ])
+        [InlineKeyboardButton("⏳ Auto Delete", callback_data="netpanel:autodel")],
+    ]
+    # Only the owner can appoint/remove managers. Managers get the operational controls.
+    if is_owner:
+        rows[1].append(InlineKeyboardButton("🛠 Managers", callback_data="netpanel:managers"))
+    return InlineKeyboardMarkup(rows)
 
 
 async def cmd_bot_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = await _lookup_bot(context)
-    if not doc or not update.effective_user or update.effective_user.id != int(doc["owner_id"]):
-        await update.effective_message.reply_text("This control center is available only to this bot's owner.")
+    if not doc or not update.effective_user:
+        return
+    is_owner = update.effective_user.id == int(doc["owner_id"])
+    is_manager = await _is_bot_manager(context.bot.id, update.effective_user.id)
+    if not (is_owner or is_manager):
+        await update.effective_message.reply_text("This control center is available only to this bot's owner and approved managers.")
         return
     context.user_data.pop("netpanel_action", None)
+    title = "Owner Control Center" if is_owner else "Manager Control Center"
     await update.effective_message.reply_text(
-        f"🎛 <b>Owner Control Center</b>\nManage @{context.bot.username} using the buttons below.",
-        reply_markup=_panel_home_markup(), parse_mode="HTML",
+        f"🎛 <b>{title}</b>\nManage @{context.bot.username} using the buttons below.",
+        reply_markup=_panel_home_markup(is_owner=is_owner), parse_mode="HTML",
     )
 
 
 async def _panel_account_text(context, doc):
     bot_id = int(context.bot.id)
-    users = await users_col.count_documents({"bot_id": bot_id})
+    privileged_ids = await _bot_privileged_ids(bot_id, doc["owner_id"])
+    users = await users_col.count_documents({"bot_id": bot_id, "user_id": {"$nin": privileged_ids}})
     files = await files_col.count_documents({"bot_id": bot_id, "owner_id": int(doc["owner_id"])})
     managers = await bot_managers_col.count_documents({"bot_id": bot_id})
     agg = await users_col.aggregate([
-        {"$match": {"bot_id": bot_id}},
+        {"$match": {"bot_id": bot_id, "user_id": {"$nin": privileged_ids}}},
         {"$group": {"_id": None, "n": {"$sum": {"$ifNull": ["$downloads", 0]}}}},
     ]).to_list(1)
     return (f"📊 <b>Bot Account — @{context.bot.username}</b>\n\n"
@@ -627,40 +795,63 @@ async def _bot_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     q = update.callback_query
     await q.answer()
     doc = await _lookup_bot(context)
-    if not doc or q.from_user.id != int(doc["owner_id"]):
+    if not doc:
+        return
+    is_owner = q.from_user.id == int(doc["owner_id"])
+    is_manager = await _is_bot_manager(context.bot.id, q.from_user.id)
+    if not (is_owner or is_manager):
         return
     data = q.data.split(":")
     action = data[1] if len(data) > 1 else "home"
     bot_id = int(context.bot.id)
     context.user_data.pop("netpanel_action", None)
 
+    if (action in ("managers", "managerdel") or (action == "prompt" and len(data) == 3 and data[2] == "addmanager")) and not is_owner:
+        return
     if action == "home":
-        await q.edit_message_text(f"🎛 <b>Owner Control Center</b>\n@{context.bot.username}", reply_markup=_panel_home_markup(), parse_mode="HTML")
+        title = "Owner Control Center" if is_owner else "Manager Control Center"
+        await q.edit_message_text(f"🎛 <b>{title}</b>\n@{context.bot.username}", reply_markup=_panel_home_markup(is_owner=is_owner), parse_mode="HTML")
     elif action == "account":
         await q.edit_message_text(await _panel_account_text(context, doc), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]]))
     elif action == "files":
-        items = await files_col.find({"bot_id": bot_id, "owner_id": int(doc["owner_id"])}).sort("created_at", -1).limit(10).to_list(10)
+        page = int(data[2]) if len(data) == 3 and data[2].isdigit() else 0
+        per_page = 8
+        query = {"bot_id": bot_id, "owner_id": int(doc["owner_id"])}
+        total = await files_col.count_documents(query)
+        items = await files_col.find(query).sort("created_at", -1).skip(page * per_page).limit(per_page).to_list(per_page)
         rows = []
         for item in items:
-            label = (item.get("file_name") or "File")[:28]
-            rows.append([InlineKeyboardButton(f"🗑 {label}", callback_data=f"netpanel:filedel:{item['_id']}")])
+            label = (item.get("file_name") or "File")[:24]
+            rows.append([InlineKeyboardButton(f"📄 {label}", callback_data=f"netpanel:fileinfo:{item['_id']}"), InlineKeyboardButton("🗑", callback_data=f"netpanel:filedel:{item['_id']}:{page}")])
+        nav = []
+        if page > 0: nav.append(InlineKeyboardButton("◀️ Previous", callback_data=f"netpanel:files:{page-1}"))
+        if (page + 1) * per_page < total: nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"netpanel:files:{page+1}"))
+        if nav: rows.append(nav)
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")])
-        body = "📁 <b>Recent files</b>\nTap a file to delete it. Showing up to 10 newest files."
+        body = f"📁 <b>File Manager</b>\nShowing {page*per_page+1 if total else 0}–{min((page+1)*per_page,total)} of {total} files.\nChoose a file for details or 🗑 to delete."
         if not items: body += "\n\nNo files uploaded yet."
         await q.edit_message_text(body, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
-    elif action == "filedel" and len(data) == 3:
+    elif action == "fileinfo" and len(data) == 3:
+        item = await files_col.find_one({"_id": data[2], "bot_id": bot_id, "owner_id": int(doc["owner_id"])})
+        if not item:
+            await q.edit_message_text("File not found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📁 Back to files", callback_data="netpanel:files")]])); return
+        created = item.get("created_at")
+        created_text = created.strftime("%Y-%m-%d %H:%M UTC") if hasattr(created, "strftime") else str(created or "Unknown")
+        size = item.get("file_size") or item.get("file_size_bytes")
+        size_text = _fmt_size(int(size)) if isinstance(size, (int, float)) and size >= 0 else "Not recorded"
+        await q.edit_message_text(f"📄 <b>File details</b>\n\n<b>Name:</b> {html.escape(str(item.get('file_name') or 'File')[:180])}\n<b>Size:</b> {size_text}\n<b>Added:</b> {created_text}\n<b>File ID:</b> <code>{item['_id']}</code>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Delete file", callback_data=f"netpanel:filedel:{item['_id']}:0")], [InlineKeyboardButton("⬅️ Back to files", callback_data="netpanel:files")]]))
+    elif action == "filedel" and len(data) in (3, 4):
         token = data[2]
+        page = int(data[3]) if len(data) == 4 and data[3].isdigit() else 0
         item = await files_col.find_one({"_id": token, "bot_id": bot_id, "owner_id": int(doc["owner_id"])})
         if item:
             try: await _main_bot.delete_message(STORAGE_CHANNEL_ID, int(item["storage_message_id"]))
             except Exception: log.warning("Could not delete storage message for network file %s", token)
             await files_col.delete_one({"_id": token, "bot_id": bot_id, "owner_id": int(doc["owner_id"])})
-        items = await files_col.find({"bot_id": bot_id, "owner_id": int(doc["owner_id"])}).sort("created_at", -1).limit(10).to_list(10)
-        rows = [[InlineKeyboardButton(f"🗑 {(x.get('file_name') or 'File')[:28]}", callback_data=f"netpanel:filedel:{x['_id']}")] for x in items]
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")])
-        await q.edit_message_text("✅ File deleted." if item else "File was not found.", reply_markup=InlineKeyboardMarkup(rows))
+        await q.edit_message_text("✅ File deleted." if item else "File was not found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📁 Back to files", callback_data=f"netpanel:files:{page}")], [InlineKeyboardButton("🏠 Main menu", callback_data="netpanel:home")]]))
     elif action == "users":
-        items = await users_col.find({"bot_id": bot_id}).sort("last_seen", -1).limit(10).to_list(10)
+        privileged_ids = await _bot_privileged_ids(bot_id, doc["owner_id"])
+        items = await users_col.find({"bot_id": bot_id, "user_id": {"$nin": privileged_ids}}).sort("last_seen", -1).limit(10).to_list(10)
         rows = []
         for item in items:
             uid = int(item["user_id"])
@@ -671,8 +862,8 @@ async def _bot_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await q.edit_message_text("👥 <b>Recent users</b>\nTap a user to toggle their access.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
     elif action in ("ban", "unban") and len(data) == 3 and data[2].isdigit():
         uid = int(data[2])
-        if uid == int(doc["owner_id"]):
-            await q.edit_message_text("You cannot ban the owner.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👥 Back to users", callback_data="netpanel:users")]])); return
+        if uid in await _bot_privileged_ids(bot_id, doc["owner_id"]):
+            await q.edit_message_text("You cannot ban the owner or a manager.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👥 Back to users", callback_data="netpanel:users")]])); return
         if action == "ban":
             await bot_bans_col.update_one({"bot_id": bot_id, "user_id": uid}, {"$set": {"bot_id": bot_id, "user_id": uid, "banned_at": datetime.now(timezone.utc)}}, upsert=True)
             msg = f"🚫 User {uid} banned."
@@ -707,6 +898,9 @@ async def _bot_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif action == "channel":
         context.user_data["netpanel_action"] = "channel"
         await q.edit_message_text("📢 Send your channel link, optionally followed by | and button text.\nExample: https://t.me/mychannel | 📢 Join my channel\nSend /cancel to stop.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]]))
+    elif action == "autodel":
+        context.user_data["netpanel_action"] = "autodel"
+        await q.edit_message_text(f"⏳ Current auto-delete: {_fmt_time(int(doc.get('auto_del', 300)))}\nSend the new delay in seconds (minimum 30, maximum 86400).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]]))
     elif action == "broadcast":
         rows = [[InlineKeyboardButton("📝 Broadcast text", callback_data="netpanel:prompt:broadcast")], [InlineKeyboardButton("🖼 Broadcast media", callback_data="netpanel:prompt:broadcast_media")], [InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]]
         await q.edit_message_text("📡 <b>Broadcast</b>\nChoose text or media broadcast. Only users who started this bot are targeted.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
@@ -728,13 +922,22 @@ async def _bot_panel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not action or not update.effective_user:
         return
     doc = await _lookup_bot(context)
-    if not doc or update.effective_user.id != int(doc["owner_id"]):
+    if not doc or not (update.effective_user.id == int(doc["owner_id"]) or await _is_bot_manager(context.bot.id, update.effective_user.id)):
         context.user_data.pop("netpanel_action", None)
         return
     msg = update.effective_message
     value = (msg.text or "").strip()
     bot_id = int(context.bot.id)
-    if action == "welcome":
+    if action == "addmanager" and update.effective_user.id != int(doc["owner_id"]):
+        context.user_data.pop("netpanel_action", None)
+        await msg.reply_text("Only this bot's owner can add managers.")
+        return
+    if action == "autodel":
+        if not value.isdigit() or not 30 <= int(value) <= 86400:
+            await msg.reply_text("Send a whole number of seconds between 30 and 86400."); return
+        await bots_col.update_one({"_id": bot_id, "owner_id": int(doc["owner_id"])}, {"$set": {"auto_del": int(value)}})
+        result = f"✅ Auto-delete updated to {_fmt_time(int(value))}."
+    elif action == "welcome":
         if not value or len(value) > 3500:
             await msg.reply_text("Please send welcome text between 1 and 3500 characters."); return
         await bots_col.update_one({"_id": bot_id, "owner_id": int(doc["owner_id"])}, {"$set": {"welcome_text": value}})
@@ -766,7 +969,8 @@ async def _bot_panel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await msg.reply_text("❌ Could not add channel. Ensure the main Gudu bot is an admin and the channel ID is correct."); return
     elif action == "broadcast":
-        targets = await users_col.find({"bot_id": bot_id}, {"user_id": 1}).to_list(None)
+        privileged_ids = await _bot_privileged_ids(bot_id, doc["owner_id"])
+        targets = await users_col.find({"bot_id": bot_id, "user_id": {"$nin": privileged_ids}}, {"user_id": 1}).to_list(None)
         sent = failed = 0
         status = await msg.reply_text(f"📡 Broadcasting to {len(targets)} users…")
         for target in targets:
@@ -786,9 +990,10 @@ async def _bot_panel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _bot_panel_broadcast_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = await _lookup_bot(context)
     msg = update.effective_message
-    if not doc or not update.effective_user or update.effective_user.id != int(doc["owner_id"]):
+    if not doc or not update.effective_user or not (update.effective_user.id == int(doc["owner_id"]) or await _is_bot_manager(context.bot.id, update.effective_user.id)):
         context.user_data.pop("netpanel_action", None); return
-    targets = await users_col.find({"bot_id": int(context.bot.id)}, {"user_id": 1}).to_list(None)
+    privileged_ids = await _bot_privileged_ids(context.bot.id, doc["owner_id"])
+    targets = await users_col.find({"bot_id": int(context.bot.id), "user_id": {"$nin": privileged_ids}}, {"user_id": 1}).to_list(None)
     sent = failed = 0
     status = await msg.reply_text(f"📡 Broadcasting media to {len(targets)} users…")
     for target in targets:
@@ -913,7 +1118,13 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             me = await candidate.get_me()
             await _validate_customer_bot_access(candidate, me.id)
             await bots_col.update_one({"_id": bot_id, "owner_id": uid}, {"$set": {"status": "starting", "verified_at": datetime.now(timezone.utc)}})
-            await _start_runtime(await bots_col.find_one({"_id": bot_id}))
+            started = await _start_runtime(await bots_col.find_one({"_id": bot_id}))
+            if not started:
+                await q.message.reply_text(
+                    "⚠️ Your bot passed technical verification, but it cannot start until you join every Main Bot /fsub channel. "
+                    "Join the required channels and try Continue Verification again."
+                )
+                return
             await verification_requests_col.update_one({"_id": bot_id}, {"$set": {"status": "completed", "completed_at": datetime.now(timezone.utc)}})
             await q.message.reply_text(f"🎉 Your bot is connected!\n\n🤖 @{doc['username']}\n🟢 Status: Running\n\nOpen @{doc['username']} and send a file to test it.")
         except Exception:
@@ -949,7 +1160,8 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not b:
             await q.message.reply_text("Bot not found in your account.")
             return
-        users = await users_col.count_documents({"bot_id": bot_id})
+        privileged_ids = await _bot_privileged_ids(bot_id, b["owner_id"])
+        users = await users_col.count_documents({"bot_id": bot_id, "user_id": {"$nin": privileged_ids}})
         files = await files_col.count_documents({"bot_id": bot_id, "owner_id": uid})
         rows = [
             [InlineKeyboardButton("📊 Statistics", callback_data=f"network_stats_{bot_id}"), InlineKeyboardButton("📁 Manage Files", callback_data=f"network_files_{bot_id}")],
@@ -990,8 +1202,9 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("network_stats_"):
         bot_id = int(data.rsplit("_", 1)[1]); b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
         if not b: return
-        users = await users_col.count_documents({"bot_id": bot_id}); files = await files_col.count_documents({"bot_id": bot_id, "owner_id": uid})
-        downloads = await users_col.aggregate([{"$match":{"bot_id":bot_id}},{"$group":{"_id":None,"n":{"$sum":"$downloads"}}}]).to_list(1)
+        privileged_ids = await _bot_privileged_ids(bot_id, b["owner_id"])
+        users = await users_col.count_documents({"bot_id": bot_id, "user_id": {"$nin": privileged_ids}}); files = await files_col.count_documents({"bot_id": bot_id, "owner_id": uid})
+        downloads = await users_col.aggregate([{"$match":{"bot_id":bot_id,"user_id":{"$nin":privileged_ids}}},{"$group":{"_id":None,"n":{"$sum":"$downloads"}}}]).to_list(1)
         await q.message.reply_text(f"📊 @{b['username']}\n👥 Users: {users}\n📦 Files: {files}\n📥 Downloads: {downloads[0]['n'] if downloads else 0}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"network_manage_{bot_id}")]]))
     elif data.startswith("network_addfsub_"):
         bot_id = int(data.rsplit("_",1)[1]); b = await bots_col.find_one({"_id":bot_id,"owner_id":uid})
@@ -1168,7 +1381,8 @@ async def network_text_message(update: Update, context: ContextTypes.DEFAULT_TYP
         body = (update.message.text or "").strip()
         if not body:
             await update.message.reply_text("Please send a text message to broadcast."); return True
-        targets = await users_col.find({"bot_id": bot_id}, {"user_id": 1}).to_list(None)
+        privileged_ids = await _bot_privileged_ids(bot_id, b["owner_id"])
+        targets = await users_col.find({"bot_id": bot_id, "user_id": {"$nin": privileged_ids}}, {"user_id": 1}).to_list(None)
         sent = failed = 0
         for target in targets:
             try:
@@ -1219,10 +1433,19 @@ async def _bot_account_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
     owned = await bots_col.find({"owner_id": int(doc["owner_id"])}).to_list(None)
     bot_ids = [int(x["_id"]) for x in owned]
-    users = await users_col.count_documents({"bot_id": {"$in": bot_ids}}) if bot_ids else 0
+    users = downloads_total = 0
+    for owned_bot in owned:
+        bid = int(owned_bot["_id"])
+        normal_filter = await _normal_bot_user_filter(bid, owned_bot["owner_id"])
+        users += await users_col.count_documents(normal_filter)
+        per_bot_downloads = await users_col.aggregate([
+            {"$match": normal_filter},
+            {"$group": {"_id": None, "n": {"$sum": {"$ifNull": ["$downloads", 0]}}}},
+        ]).to_list(1)
+        downloads_total += per_bot_downloads[0]["n"] if per_bot_downloads else 0
     files = await files_col.count_documents({"bot_id": {"$in": bot_ids}, "owner_id": int(doc["owner_id"])}) if bot_ids else 0
     managers = await bot_managers_col.count_documents({"bot_id": {"$in": bot_ids}}) if bot_ids else 0
-    downloads = await users_col.aggregate([{"$match": {"bot_id": {"$in": bot_ids}}}, {"$group": {"_id": None, "n": {"$sum": "$downloads"}}}]).to_list(1) if bot_ids else []
+    downloads = [{"n": downloads_total}] if bot_ids else []
     await q.edit_message_text(
         f"👤 <b>My Account — @{context.bot.username}</b>\n\n📦 Files: <b>{files}</b>\n"
         f"👥 Users: <b>{users}</b>\n📥 Downloads: <b>{downloads[0]['n'] if downloads else 0}</b>\n"

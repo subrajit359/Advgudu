@@ -830,7 +830,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔒 Main-Bot Force Sub", callback_data="adm_listfsub")],
         [InlineKeyboardButton("📝 Edit Messages", callback_data="adm_listmsgs"),
          InlineKeyboardButton("📦 List Files", callback_data="adm_listfiles")],
-        [InlineKeyboardButton("➕ Add FSub", callback_data="adm_addfsub_help"),
+        [InlineKeyboardButton("➕ Add Main FSub", callback_data="adm_addfsub_help"),
          InlineKeyboardButton("➖ Remove FSub", callback_data="adm_removefsub_help")],
         [InlineKeyboardButton("⏳ Auto Delete", callback_data="adm_autodel_help"),
          InlineKeyboardButton("📡 Broadcast", callback_data="adm_broadcast_help")],
@@ -1023,7 +1023,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif d == "adm_listfsub":
         channels = await db_get_fsub()
-        text = "📋 <b>Force Sub Channels:</b>\n\n" if channels else "No force sub channels.\n\nUse /addfsub &lt;id1&gt; &lt;id2&gt; ..."
+        text = "📋 <b>Force Sub Channels:</b>\n\n" if channels else "No force sub channels.\n\nUse /fsub &lt;id1&gt; &lt;id2&gt; ..."
         for ch in channels:
             text += f"• <b>{ch.get('title','?')}</b>\n  <code>{ch['_id']}</code>\n\n"
         await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=_back_btn())
@@ -1136,8 +1136,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "➕ <b>Add Force Sub</b>\n\n"
             "1. Add bot as <b>admin</b> to channel\n"
             "2. Run (supports multiple):\n\n"
-            "<code>/addfsub -100xxx</code>\n"
-            "<code>/addfsub -100xxx -100yyy -100zzz</code>\n\n"
+            "<code>/fsub -100xxx</code>\n"
+            "<code>/fsub -100xxx -100yyy -100zzz</code>\n\n"
             "<i>Get ID via @userinfobot</i>",
             parse_mode="HTML", reply_markup=_back_btn()
         )
@@ -1312,9 +1312,9 @@ async def cmd_addfsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not context.args:
         await update.message.reply_text(
-            "Usage:\n/addfsub <channel_id> [invite_link]\n"
-            "Example: /addfsub -1001234567890 https://t.me/+YourInviteLink\n"
-            "For multiple channels, provide IDs without links: /addfsub -100111 -100222"
+            "Usage:\n/fsub <channel_id> [invite_link]\n"
+            "Example: /fsub -1001234567890 https://t.me/+YourInviteLink\n"
+            "For multiple channels, provide IDs without links: /fsub -100111 -100222"
         )
         return
 
@@ -1577,7 +1577,8 @@ def main():
     app.add_handler(CommandHandler("listfsubmem", cmd_network_fsub_list))
     app.add_handler(CommandHandler("botverifyqueue", cmd_botverifyqueue))
     app.add_handler(CommandHandler("setbotverifier", cmd_setbotverifier))
-    app.add_handler(CommandHandler("addfsub", cmd_addfsub))
+    app.add_handler(CommandHandler("fsub", cmd_addfsub))
+    app.add_handler(CommandHandler("addfsub", cmd_addfsub))  # backward-compatible alias
     app.add_handler(CommandHandler("setfsublink", cmd_setfsublink))
     app.add_handler(CommandHandler("removefsub", cmd_removefsub))
     app.add_handler(CommandHandler("listfsub", cmd_listfsub))

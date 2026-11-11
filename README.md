@@ -336,3 +336,12 @@ The dashboard provides:
 - **Broadcast** — send text or a media message to users who have started this bot.
 
 Use `/cancel` to leave a dashboard input prompt. The dashboard is owner-only; managers retain their upload permissions but do not receive owner controls.
+
+## Separate Main-Bot and Member-Bot Force Subscribe lists
+
+- `/fsub CHANNEL_ID` adds a channel to the Main Bot Force Subscribe list (`fsub_channels`). It gates Main Bot users and is also checked against each member-bot owner's Telegram membership. If an owner leaves any `/fsub` channel, only that owner's member bot(s) are suspended. The monitor checks every 60 seconds and reactivates those bots after the owner rejoins and membership is verified.
+- `/fsubmem CHANNEL_ID` adds a channel to the Member-Bot Force Join list (`network_global_fsub`). It is required for users receiving files through Member Bots; it is not the owner-suspension list.
+- `/removefsub` and `/listfsub` manage the Main Bot list. `/removefsubmem` and `/listfsubmem` manage the Member-Bot user list.
+- Existing `/addfsub` remains as a backward-compatible alias for `/fsub`.
+
+The two channel collections remain separate. Member bots continue to run as independent Telegram bots; their management remains in the Main Bot's member control center.
