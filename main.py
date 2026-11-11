@@ -18,7 +18,10 @@ from config import (
     DB_URI, DB_NAME, DB_CHANNEL, AUTO_DEL,
     START_PHOTO, FSUB_PHOTO, DEFAULT_MESSAGES,
 )
-from ai_assistant import create_ai_plan, rate_limited
+from ai_assistant import (
+    AI_HISTORY_KEEP, AI_HISTORY_SUMMARIZE_AT,
+    create_ai_plan, rate_limited, summarize_ai_history,
+)
 from network import (
     startup_network_bots, shutdown_network_bots, network_callback,
     network_text_message, cmd_network_fsub_add, cmd_network_fsub_remove, _delete_bot_data,
@@ -1830,6 +1833,8 @@ async def main_ai_start(update, context):
     context.user_data["gudu_ai_enabled"] = True
     context.user_data.pop("gudu_ai_pending", None)
     context.user_data.pop("gudu_ai_pending_at", None)
+    context.user_data.pop("gudu_ai_summary", None)
+    context.user_data.pop("gudu_ai_history", None)
     await update.effective_message.reply_text("🤖 Gudu AI is ready. Tell me what you need in natural language.\nUse /aistop to leave AI chat. Sensitive actions require confirmation.")
 
 async def main_ai_stop(update, context):
@@ -1837,6 +1842,7 @@ async def main_ai_stop(update, context):
     context.user_data.pop("gudu_ai_pending", None)
     context.user_data.pop("gudu_ai_pending_at", None)
     context.user_data.pop("gudu_ai_history", None)
+    context.user_data.pop("gudu_ai_summary", None)
     await update.effective_message.reply_text("Gudu AI chat paused. Use /ai whenever you want to chat again.")
 
 async def _main_ai_allowed_actions(uid):
@@ -1954,8 +1960,22 @@ async def main_ai_message(update, context):
     actions = await _main_ai_allowed_actions(uid)
     role = "Super Admin" if _is_admin(uid) else "AdminGG manager" if await _is_manager(uid) else "user"
     history = context.user_data.setdefault("gudu_ai_history", [])
+    summary = context.user_data.get("gudu_ai_summary", "")
+    # Compact older turns before the active history grows too large. If the
+    # provider is unavailable for summarization, keep the session usable by
+    # trimming to the configured recent-turn window.
+    if len(history) >= AI_HISTORY_SUMMARIZE_AT:
+        try:
+            new_summary = await summarize_ai_history(history)
+            if new_summary:
+                summary = new_summary
+                context.user_data["gudu_ai_summary"] = summary
+        except Exception:
+            logging.exception("Gudu AI session summarization failed")
+        history = history[-AI_HISTORY_KEEP:]
+        context.user_data["gudu_ai_history"] = history
     try:
-        plan = await create_ai_plan(update.effective_message.text or "", history, actions, role)
+        plan = await create_ai_plan(update.effective_message.text or "", history, actions, role, summary)
     except RuntimeError as exc:
         if str(exc) == "AI_NOT_CONFIGURED": await update.effective_message.reply_text("AI is not configured yet. Please contact the bot owner."); return
         await update.effective_message.reply_text("AI is temporarily unavailable. Please try again later."); return
@@ -1963,7 +1983,7 @@ async def main_ai_message(update, context):
         logging.exception("Gudu AI request failed")
         await update.effective_message.reply_text("AI is temporarily unavailable. Please try again later."); return
     history.extend([{"role": "user", "content": update.effective_message.text or ""}, {"role": "assistant", "content": plan["reply"]}])
-    context.user_data["gudu_ai_history"] = history[-16:]
+    context.user_data["gudu_ai_history"] = history[-AI_HISTORY_KEEP:]
     action = plan.get("action")
     if not action:
         await update.effective_message.reply_text(plan["reply"] or "How can I help?"); return
@@ -1974,7 +1994,7 @@ async def main_ai_message(update, context):
         await update.effective_message.reply_text((plan["reply"] + "\n\n" + summary + "\n\nDo you want me to proceed?").strip(), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm", callback_data="gai:confirm"), InlineKeyboardButton("Cancel", callback_data="gai:cancel")]])); return
     result = await _main_ai_execute(update, context, action)
     history.append({"role": "assistant", "content": result or "The requested action was completed."})
-    context.user_data["gudu_ai_history"] = history[-16:]
+    context.user_data["gudu_ai_history"] = history[-AI_HISTORY_KEEP:]
     if result: await update.effective_message.reply_text(result, parse_mode="HTML")
 
 async def main_ai_callback(update, context):
@@ -1992,7 +2012,7 @@ async def main_ai_callback(update, context):
     result = await _main_ai_execute(update, context, pending)
     history = context.user_data.setdefault("gudu_ai_history", [])
     history.append({"role": "assistant", "content": result or "The requested action was completed."})
-    context.user_data["gudu_ai_history"] = history[-16:]
+    context.user_data["gudu_ai_history"] = history[-AI_HISTORY_KEEP:]
     await q.edit_message_text(result or "✅ Action completed.", parse_mode="HTML")
 
 async def post_init(app):
