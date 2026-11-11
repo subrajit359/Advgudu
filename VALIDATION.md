@@ -58,3 +58,11 @@ Live Telegram/MongoDB tests are still required; static checks do not prove runti
 - `python -m compileall -q` and AST compilation passed for all Python source files.
 - Mock async tests passed for manager lookup, cross-bot isolation, and owner/manager exclusion.
 - Live Telegram and MongoDB integration tests were not run because the local environment does not contain `python-telegram-bot`, `motor`, or `pymongo`, and no production credentials were provided.
+
+
+## V3 permission callback recheck (2026-11-12)
+
+- Fixed AdminGG callback parsing for underscore-containing permission keys.
+- Confirmed member-manager callback parsing preserves complete keys and uses a bot-scoped manager lookup.
+- Static callback parsing assertions and Python compilation passed.
+- Live Telegram/MongoDB staging tests remain outstanding.

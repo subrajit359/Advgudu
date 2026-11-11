@@ -584,22 +584,18 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("This section is for the bot owner only.", show_alert=True)
     elif q.data == "user_manager":
         if await _is_manager(q.from_user.id):
-            await _edit_callback_message(
-                q,
-                "🛠 <b>AdminGG Manager Panel</b>\n\n"
-                "Send a document, photo, video, or audio here to save it and get a shareable link.\n\n"
-                "You can also view usage statistics and the auto-delete setting.",
-                InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📊 Users & Files Stats", callback_data="mg_stats")],
-                    [InlineKeyboardButton("⏳ Auto Delete", callback_data="mg_autodel")],
-                    [InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")],
-                ])
-            )
+            rows = []
+            if await _manager_has_permission(q.from_user.id, "view_stats"):
+                rows.append([InlineKeyboardButton("📊 Users & Files Stats", callback_data="mg_stats")])
+            if await _manager_has_permission(q.from_user.id, "manage_autodel"):
+                rows.append([InlineKeyboardButton("⏳ Auto Delete", callback_data="mg_autodel")])
+            rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")])
+            await _edit_callback_message(q, "🛠 <b>AdminGG Manager Panel</b>\n\nYour dashboard contains only the features delegated by Admin. Upload files by sending supported media here.", InlineKeyboardMarkup(rows))
         else:
             await q.answer("AdminGG access is for approved managers only.", show_alert=True)
     elif q.data == "mg_stats":
-        if not await _is_manager(q.from_user.id):
-            await q.answer("Manager access only.", show_alert=True)
+        if not await _manager_has_permission(q.from_user.id, "view_stats"):
+            await q.answer("You do not have permission to view statistics.", show_alert=True)
             return
         text = (
             "📊 <b>AdminGG Usage Stats</b>\n\n"
@@ -612,8 +608,8 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅️ AdminGG Panel", callback_data="user_manager")],
         ]))
     elif q.data == "mg_autodel":
-        if not await _is_manager(q.from_user.id):
-            await q.answer("Manager access only.", show_alert=True)
+        if not await _manager_has_permission(q.from_user.id, "manage_autodel"):
+            await q.answer("You do not have permission to change auto-delete.", show_alert=True)
             return
         seconds = await db_get_auto_del()
         text = (
@@ -628,8 +624,8 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⬅️ AdminGG Panel", callback_data="user_manager")],
         ]))
     elif q.data.startswith("mg_setdel_"):
-        if not await _is_manager(q.from_user.id):
-            await q.answer("Manager access only.", show_alert=True)
+        if not await _manager_has_permission(q.from_user.id, "manage_autodel"):
+            await q.answer("You do not have permission to change auto-delete.", show_alert=True)
             return
         try:
             seconds = int(q.data.rsplit("_", 1)[1])
@@ -844,8 +840,24 @@ async def _is_manager(uid):
     return await managers_col.find_one({"_id": uid}) is not None
 
 
+ADMIN_GG_PERMISSIONS = {
+    "upload_files": "Upload files",
+    "view_stats": "View statistics",
+    "manage_autodel": "Change auto-delete",
+}
+
+async def _manager_has_permission(uid, permission):
+    if _is_admin(uid):
+        return True
+    doc = await managers_col.find_one({"_id": uid})
+    if not doc:
+        return False
+    # Existing managers are migrated safely: retain their previous upload-only access.
+    permissions = doc.get("permissions", {"upload_files": True})
+    return bool(permissions.get(permission, False))
+
 async def _can_upload(uid):
-    return _is_admin(uid) or await _is_manager(uid)
+    return await _manager_has_permission(uid, "upload_files")
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -968,10 +980,51 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not bots:
             await q.message.reply_text("Member has no registered bots."); return
         text = f"👤 <b>Member:</b> <code>{member_id}</code>\n🤖 Bots: <b>{len(bots)}</b>\n\n"
+        rows = []
         for b in bots:
             text += f"• @{b.get('username','unknown')} — {b.get('status','unknown')} (ID <code>{b['_id']}</code>)\n"
-        rows = [[InlineKeyboardButton("🚫 Suspend member bots", callback_data=f"adm_member_suspend_{member_id}")], [InlineKeyboardButton("▶️ Reactivate bots", callback_data=f"adm_member_resume_{member_id}")], [InlineKeyboardButton("⬅️ Members", callback_data="adm_network_members")]]
+            rows.append([InlineKeyboardButton(f"🤖 @{b.get('username','unknown')} · {b.get('status','unknown')}", callback_data=f"adm_botctl_{b['_id']}")])
+        rows += [[InlineKeyboardButton("🚫 Suspend member bots", callback_data=f"adm_member_suspend_{member_id}")], [InlineKeyboardButton("▶️ Reactivate bots", callback_data=f"adm_member_resume_{member_id}")], [InlineKeyboardButton("⬅️ Members", callback_data="adm_network_members")]]
         await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif d.startswith("adm_botctl_"):
+        try: bot_id = int(d[len("adm_botctl_"):])
+        except ValueError: return
+        bot_doc = await _db["network_bots"].find_one({"_id": bot_id})
+        if not bot_doc: await q.message.reply_text("Bot not found."); return
+        text = (f"🤖 <b>@{html.escape(str(bot_doc.get('username','unknown')))}</b>\n"
+                f"Owner: <code>{bot_doc.get('owner_id')}</code>\nBot ID: <code>{bot_id}</code>\n"
+                f"Status: <b>{html.escape(str(bot_doc.get('status','unknown')))}</b>\n"
+                f"Runtime: <b>{'Running' if bot_id in __import__('network')._running else 'Not running'}</b>")
+        rows = [[InlineKeyboardButton("▶️ Start", callback_data=f"adm_botstart_{bot_id}"), InlineKeyboardButton("⏸ Stop", callback_data=f"adm_botstop_{bot_id}")],
+                [InlineKeyboardButton("🔄 Restart", callback_data=f"adm_botrestart_{bot_id}")],
+                [InlineKeyboardButton("⬅️ Member", callback_data=f"adm_member_{bot_doc.get('owner_id')}")]]
+        await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif d.startswith(("adm_botstart_", "adm_botstop_", "adm_botrestart_")):
+        import network as network_runtime
+        action, raw_id = d.rsplit("_", 1)
+        try: bot_id = int(raw_id)
+        except ValueError: return
+        bot_doc = await _db["network_bots"].find_one({"_id": bot_id})
+        if not bot_doc: await q.message.reply_text("Bot not found."); return
+        try:
+            if action == "adm_botstop":
+                await network_runtime._stop_runtime(bot_id)
+                await _db["network_bots"].update_one({"_id": bot_id}, {"$set": {"status": "stopped_by_admin"}})
+                result = "⏸ Bot stopped by Admin."
+            else:
+                if action == "adm_botrestart": await network_runtime._stop_runtime(bot_id)
+                await _db["network_bots"].update_one({"_id": bot_id}, {"$set": {"status": "starting"}})
+                fresh = await _db["network_bots"].find_one({"_id": bot_id})
+                started = await network_runtime._start_runtime(fresh)
+                result = "✅ Bot started." if started else "⚠️ Start was blocked by verification, subscription, or runtime requirements."
+            await q.answer(result, show_alert=True)
+        except Exception:
+            await _db["network_bots"].update_one({"_id": bot_id}, {"$set": {"status": "error"}})
+            await q.answer("❌ Operation failed. Check server logs.", show_alert=True)
+        fresh = await _db["network_bots"].find_one({"_id": bot_id})
+        await _edit_callback_message(q, f"🤖 <b>@{html.escape(str(fresh.get('username','unknown')))}</b>\nStatus: <b>{html.escape(str(fresh.get('status','unknown')))}</b>\nRuntime: <b>{'Running' if bot_id in network_runtime._running else 'Not running'}</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Start", callback_data=f"adm_botstart_{bot_id}"), InlineKeyboardButton("⏸ Stop", callback_data=f"adm_botstop_{bot_id}")], [InlineKeyboardButton("🔄 Restart", callback_data=f"adm_botrestart_{bot_id}")], [InlineKeyboardButton("⬅️ Member", callback_data=f"adm_member_{fresh.get('owner_id')}")]]))
 
     elif d.startswith("adm_member_suspend_") or d.startswith("adm_member_resume_"):
         suspend = d.startswith("adm_member_suspend_")
@@ -998,16 +1051,48 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "🛠 <b>AdminGG Manager Management</b>\n\n"
             f"👥 Total managers: <b>{len(managers)}</b>\n\n"
-            "AdminGG permissions: upload files and generate share links only. "
-            "They cannot access the owner dashboard or manage channels, users, broadcasts, or settings.\n\n"
+            "Select a manager below to customize delegated permissions.\n\n"
             "➕ Add manager: <code>/addmanager USER_ID</code>\n"
             "➖ Remove manager: use the button below.\n"
             "📋 List managers: <code>/listmanagers</code>"
         )
-        rows = [[InlineKeyboardButton(f"❌ Remove {m['_id']}", callback_data=f"adm_mgr_remove_{m['_id']}")] for m in managers]
+        rows = [[InlineKeyboardButton(f"⚙️ {m['_id']} · Permissions", callback_data=f"adm_mgr_perms_{m['_id']}"), InlineKeyboardButton("❌", callback_data=f"adm_mgr_remove_{m['_id']}")] for m in managers]
         rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="adm_managers")])
         rows.append([InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="adm_back")])
         await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif d.startswith("adm_mgr_perms_"):
+        try: uid = int(d[len("adm_mgr_perms_"):])
+        except ValueError: return
+        manager = await managers_col.find_one({"_id": uid})
+        if not manager: await q.message.reply_text("Manager not found."); return
+        perms = manager.get("permissions", {"upload_files": True})
+        rows = [[InlineKeyboardButton(("✅ " if perms.get(k, False) else "⬜ ") + label, callback_data=f"adm_mgr_toggle_{uid}_{k}")] for k, label in ADMIN_GG_PERMISSIONS.items()]
+        rows.append([InlineKeyboardButton("⬅️ Managers", callback_data="adm_managers")])
+        await _edit_callback_message(q, f"⚙️ <b>AdminGG Permissions</b>\nManager: <code>{uid}</code>\n\nTap a permission to enable/disable it. Changes apply immediately.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif d.startswith("adm_mgr_toggle_"):
+        # Permission keys contain underscores (for example upload_files).
+        # Split only once after the manager ID so the full key is preserved.
+        payload = d[len("adm_mgr_toggle_"):]
+        try:
+            raw_uid, key = payload.split("_", 1)
+            uid = int(raw_uid)
+        except (ValueError, IndexError):
+            await q.answer("Invalid permission action.", show_alert=True)
+            return
+        if key not in ADMIN_GG_PERMISSIONS:
+            await q.answer("Unknown permission.", show_alert=True)
+            return
+        manager = await managers_col.find_one({"_id": uid})
+        if not manager: await q.answer("Manager not found", show_alert=True); return
+        perms = manager.get("permissions", {"upload_files": True})
+        new_value = not bool(perms.get(key, False))
+        await managers_col.update_one({"_id": uid}, {"$set": {f"permissions.{key}": new_value}})
+        manager["permissions"] = {**perms, key: new_value}
+        rows = [[InlineKeyboardButton(("✅ " if manager["permissions"].get(k, False) else "⬜ ") + label, callback_data=f"adm_mgr_toggle_{uid}_{k}")] for k, label in ADMIN_GG_PERMISSIONS.items()]
+        rows.append([InlineKeyboardButton("⬅️ Managers", callback_data="adm_managers")])
+        await _edit_callback_message(q, f"⚙️ <b>AdminGG Permissions</b>\nManager: <code>{uid}</code>\n\nUpdated immediately.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
 
     elif d.startswith("adm_mgr_remove_"):
         try:
@@ -1294,7 +1379,7 @@ async def cmd_addmanager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid == OWNER_ID:
         await update.message.reply_text("The owner already has full admin access.")
         return
-    await managers_col.update_one({"_id": uid}, {"$set": {"_id": uid, "added_by": OWNER_ID}}, upsert=True)
+    await managers_col.update_one({"_id": uid}, {"$set": {"_id": uid, "added_by": OWNER_ID, "permissions": {"upload_files": True}}}, upsert=True)
     await update.message.reply_text(f"✅ <code>{uid}</code> added as AdminGG manager. They can upload files and receive share links only.", parse_mode="HTML")
 
 
@@ -1470,7 +1555,7 @@ async def cmd_mongo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_setautodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _can_upload(update.effective_user.id): return
+    if not update.effective_user or not await _manager_has_permission(update.effective_user.id, "manage_autodel"): return
     if not context.args:
         await update.message.reply_text("Usage: /setautodel <seconds>")
         return
@@ -1624,8 +1709,8 @@ def main():
     app.add_handler(CommandHandler("resetkey", resetkey_handler))
     app.add_handler(CallbackQueryHandler(user_callback, pattern="^(user_|key_|mg_|fsub_verify:|network_create$)"))
     app.add_handler(CallbackQueryHandler(network_callback, pattern=r"^network_"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, network_text_message), group=0)
-    app.add_handler(CommandHandler("cancel", network_cancel))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, network_text_message), group=0)
+    app.add_handler(CommandHandler("cancel", network_cancel, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("addmanager", cmd_addmanager))
     app.add_handler(CommandHandler("removemanager", cmd_removemanager))

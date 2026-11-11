@@ -236,7 +236,7 @@ async def _start_runtime(doc):
         app.add_handler(CallbackQueryHandler(_bot_verify_callback, pattern=r"^netverify:"))
         app.add_handler(CallbackQueryHandler(_bot_account_callback, pattern=r"^netaccount$"))
         app.add_handler(CallbackQueryHandler(_bot_panel_callback, pattern=r"^netpanel:"))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _bot_panel_text))
+        app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, _bot_panel_text))
         app.add_handler(MessageHandler(
             filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO,
             _bot_upload,
@@ -335,6 +335,25 @@ async def _is_bot_manager(bot_id, user_id):
         "bot_id": int(bot_id),
         "user_id": int(user_id),
     }) is not None
+
+
+BOT_MANAGER_PERMISSIONS = {
+    "upload_files": "Upload files", "manage_files": "View/delete files",
+    "view_users": "View users", "manage_users": "Ban/unban users",
+    "manage_fjoin": "Manage Force Join", "edit_welcome": "Edit welcome message",
+    "edit_channel": "Manage channel button", "broadcast": "Broadcast",
+    "manage_autodel": "Change auto-delete", "view_stats": "View statistics",
+}
+
+async def _bot_manager_has_permission(bot_id, user_id, permission):
+    manager = await bot_managers_col.find_one({"bot_id": int(bot_id), "user_id": int(user_id)})
+    if not manager:
+        return False
+    # Legacy manager documents retain their prior operational access.
+    perms = manager.get("permissions")
+    if perms is None:
+        perms = {key: True for key in BOT_MANAGER_PERMISSIONS}
+    return bool(perms.get(permission, False))
 
 
 async def _bot_privileged_ids(bot_id, owner_id):
@@ -536,6 +555,9 @@ async def _serve_file(update, context, token, doc):
 
 
 async def _bot_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # File uploads and media broadcasts are private owner/manager workflows.
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return
     # In panel media-broadcast mode, media is copied to users rather than stored as a file.
     if context.user_data.get("netpanel_action") == "broadcast_media":
         await _bot_panel_broadcast_media(update, context)
@@ -549,8 +571,8 @@ async def _bot_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("🚫 You are blocked from using this bot.")
         return
     is_manager = await bot_managers_col.find_one({"bot_id": int(context.bot.id), "user_id": user.id})
-    if user.id != int(doc["owner_id"]) and not is_manager:
-        await msg.reply_text("Only this bot's owner and approved managers can upload files. Other users can only receive shared files.")
+    if user.id != int(doc["owner_id"]) and not await _bot_manager_has_permission(context.bot.id, user.id, "upload_files"):
+        await msg.reply_text("You do not have permission to upload files on this bot.")
         return
     media = msg.document or msg.video or msg.audio or (msg.photo[-1] if msg.photo else None)
     if not media:
@@ -605,7 +627,7 @@ async def cmd_bot_addmanager(update, context):
     if uid == int(doc["owner_id"]):
         await update.effective_message.reply_text("The owner already has full access.")
         return
-    await bot_managers_col.update_one({"bot_id": int(context.bot.id), "user_id": uid}, {"$set": {"bot_id": int(context.bot.id), "user_id": uid, "added_by": update.effective_user.id, "added_at": datetime.now(timezone.utc)}}, upsert=True)
+    await bot_managers_col.update_one({"bot_id": int(context.bot.id), "user_id": uid}, {"$set": {"bot_id": int(context.bot.id), "user_id": uid, "added_by": update.effective_user.id, "added_at": datetime.now(timezone.utc), "permissions": {"upload_files": True}}}, upsert=True)
     await update.effective_message.reply_text(f"✅ User {uid} is now a manager of @{context.bot.username}.")
 
 async def cmd_bot_removemanager(update, context):
@@ -643,6 +665,7 @@ async def cmd_bot_unban(update, context):
 
 async def cmd_bot_addfjoin(update, context):
     doc = await _is_bot_owner_or_manager(update, context, owner_only=False)
+    if doc and update.effective_user.id != int(doc["owner_id"]) and not await _bot_manager_has_permission(context.bot.id, update.effective_user.id, "manage_fjoin"): return
     if not doc: return
     if not context.args or not context.args[0].lstrip('-').isdigit():
         await update.effective_message.reply_text("Usage: /addfjoin CHANNEL_ID"); return
@@ -664,6 +687,7 @@ async def cmd_bot_addchannel(update, context):
     The channel is stored only against the current customer bot.
     """
     doc = await _is_bot_owner_or_manager(update, context, owner_only=False)
+    if doc and update.effective_user.id != int(doc["owner_id"]) and not await _bot_manager_has_permission(context.bot.id, update.effective_user.id, "manage_fjoin"): return
     if not doc:
         return
     if len(context.args) != 2 or not context.args[0].lstrip("-").isdigit():
@@ -704,6 +728,7 @@ async def cmd_bot_addchannel(update, context):
 async def cmd_bot_listfjoin(update, context):
     doc = await _is_bot_owner_or_manager(update, context, owner_only=False)
     if not doc: return
+    if update.effective_user.id != int(doc["owner_id"]) and not await _bot_manager_has_permission(context.bot.id, update.effective_user.id, "manage_fjoin"): return
     own = await owner_fsub_col.find({"bot_id": int(context.bot.id)}).to_list(None)
     platform = await global_fsub_col.find().to_list(None)
     lines = ["📌 <b>Platform-required channels (set by Gudu admin)</b>"]
@@ -715,6 +740,7 @@ async def cmd_bot_listfjoin(update, context):
 async def cmd_bot_removefjoin(update, context):
     doc = await _is_bot_owner_or_manager(update, context, owner_only=False)
     if not doc: return
+    if update.effective_user.id != int(doc["owner_id"]) and not await _bot_manager_has_permission(context.bot.id, update.effective_user.id, "manage_fjoin"): return
     if not context.args or not context.args[0].lstrip('-').isdigit():
         await update.effective_message.reply_text("Usage: /removefjoin CHANNEL_ID"); return
     result = await owner_fsub_col.delete_one({"bot_id": int(context.bot.id), "_id": int(context.args[0]), "owner_id": int(doc["owner_id"])})
@@ -793,17 +819,28 @@ async def cmd_bot_myaccount(update, context):
         f"📦 Files: <b>{files}</b>\n👥 Users: <b>{users}</b>\n📥 Downloads: <b>{downloads[0]['n'] if downloads else 0}</b>\n"
         f"🤖 Bots: <b>{len(bot_ids)}</b>\n🛠 Managers: <b>{managers}</b>", parse_mode="HTML")
 
-def _panel_home_markup(is_owner=True):
-    rows = [
-        [InlineKeyboardButton("📊 My Account", callback_data="netpanel:account"), InlineKeyboardButton("📁 Files", callback_data="netpanel:files")],
-        [InlineKeyboardButton("👥 Users", callback_data="netpanel:users")],
-        [InlineKeyboardButton("🔒 Force Join", callback_data="netpanel:fjoin"), InlineKeyboardButton("✏️ Welcome", callback_data="netpanel:welcome")],
-        [InlineKeyboardButton("📢 My Channel", callback_data="netpanel:channel"), InlineKeyboardButton("📡 Broadcast", callback_data="netpanel:broadcast")],
-        [InlineKeyboardButton("⏳ Auto Delete", callback_data="netpanel:autodel")],
-    ]
-    # Only the owner can appoint/remove managers. Managers get the operational controls.
+async def _panel_home_markup(is_owner=True, bot_id=None, user_id=None):
+    rows = []
+    if is_owner or await _bot_manager_has_permission(bot_id, user_id, "view_stats"):
+        rows.append([InlineKeyboardButton("📊 My Account", callback_data="netpanel:account")])
+    if is_owner or await _bot_manager_has_permission(bot_id, user_id, "manage_files"):
+        rows.append([InlineKeyboardButton("📁 Files", callback_data="netpanel:files")])
+    if is_owner or await _bot_manager_has_permission(bot_id, user_id, "view_users"):
+        rows.append([InlineKeyboardButton("👥 Users", callback_data="netpanel:users")])
+    if is_owner or await _bot_manager_has_permission(bot_id, user_id, "manage_fjoin"):
+        rows.append([InlineKeyboardButton("🔒 Force Join", callback_data="netpanel:fjoin")])
+    if is_owner or await _bot_manager_has_permission(bot_id, user_id, "edit_welcome"):
+        rows.append([InlineKeyboardButton("✏️ Welcome", callback_data="netpanel:welcome")])
+    if is_owner or await _bot_manager_has_permission(bot_id, user_id, "edit_channel"):
+        rows.append([InlineKeyboardButton("📢 My Channel", callback_data="netpanel:channel")])
+    if is_owner or await _bot_manager_has_permission(bot_id, user_id, "broadcast"):
+        rows.append([InlineKeyboardButton("📡 Broadcast", callback_data="netpanel:broadcast")])
+    if is_owner or await _bot_manager_has_permission(bot_id, user_id, "manage_autodel"):
+        rows.append([InlineKeyboardButton("⏳ Auto Delete", callback_data="netpanel:autodel")])
     if is_owner:
-        rows[1].append(InlineKeyboardButton("🛠 Managers", callback_data="netpanel:managers"))
+        rows.append([InlineKeyboardButton("🛠 Managers", callback_data="netpanel:managers")])
+    if not rows:
+        rows.append([InlineKeyboardButton("🏠 Main menu", callback_data="netpanel:home")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -820,7 +857,7 @@ async def cmd_bot_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = "Owner Control Center" if is_owner else "Manager Control Center"
     await update.effective_message.reply_text(
         f"🎛 <b>{title}</b>\nManage @{context.bot.username} using the buttons below.",
-        reply_markup=_panel_home_markup(is_owner=is_owner), parse_mode="HTML",
+        reply_markup=_panel_home_markup(is_owner=is_owner, bot_id=context.bot.id, user_id=update.effective_user.id), parse_mode="HTML",
     )
 
 
@@ -857,11 +894,15 @@ async def _bot_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     bot_id = int(context.bot.id)
     context.user_data.pop("netpanel_action", None)
 
-    if (action in ("managers", "managerdel") or (action == "prompt" and len(data) == 3 and data[2] == "addmanager")) and not is_owner:
+    action_permissions = {"account":"view_stats", "files":"manage_files", "fileinfo":"manage_files", "filedel":"manage_files", "users":"view_users", "ban":"manage_users", "unban":"manage_users", "fjoin":"manage_fjoin", "fjoindel":"manage_fjoin", "welcome":"edit_welcome", "channel":"edit_channel", "autodel":"manage_autodel", "broadcast":"broadcast"}
+    required = action_permissions.get(action)
+    if required and not is_owner and not await _bot_manager_has_permission(bot_id, q.from_user.id, required):
+        await q.answer("You do not have permission for this action.", show_alert=True); return
+    if (action in ("managers", "managerdel", "managerperms", "permtoggle") or (action == "prompt" and len(data) == 3 and data[2] == "addmanager")) and not is_owner:
         return
     if action == "home":
         title = "Owner Control Center" if is_owner else "Manager Control Center"
-        await q.edit_message_text(f"🎛 <b>{title}</b>\n@{context.bot.username}", reply_markup=_panel_home_markup(is_owner=is_owner), parse_mode="HTML")
+        await q.edit_message_text(f"🎛 <b>{title}</b>\n@{context.bot.username}", reply_markup=_panel_home_markup(is_owner=is_owner, bot_id=bot_id, user_id=q.from_user.id), parse_mode="HTML")
     elif action == "account":
         await q.edit_message_text(await _panel_account_text(context, doc), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]]))
     elif action == "files":
@@ -924,9 +965,27 @@ async def _bot_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👥 Back to users", callback_data="netpanel:users")], [InlineKeyboardButton("🏠 Main menu", callback_data="netpanel:home")]]))
     elif action == "managers":
         items = await bot_managers_col.find({"bot_id": bot_id}).to_list(50)
-        rows = [[InlineKeyboardButton(f"➖ Remove {x['user_id']}", callback_data=f"netpanel:managerdel:{x['user_id']}")] for x in items]
+        rows = [[InlineKeyboardButton(f"⚙️ {x['user_id']} permissions", callback_data=f"netpanel:managerperms:{x['user_id']}"), InlineKeyboardButton("➖", callback_data=f"netpanel:managerdel:{x['user_id']}")] for x in items]
         rows.extend([[InlineKeyboardButton("➕ Add manager", callback_data="netpanel:prompt:addmanager")], [InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]])
-        await q.edit_message_text("🛠 <b>Manager management</b>\nRemove an existing manager or add a new one.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        await q.edit_message_text("🛠 <b>Manager management</b>\nSelect a manager to customize permissions, or remove them.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "managerperms" and len(data) == 3 and data[2].isdigit():
+        manager_id = int(data[2]); manager = await bot_managers_col.find_one({"bot_id": bot_id, "user_id": manager_id})
+        if not manager: await q.edit_message_text("Manager not found."); return
+        perms = manager.get("permissions", {k: True for k in BOT_MANAGER_PERMISSIONS})
+        rows = [[InlineKeyboardButton(("✅ " if perms.get(k, False) else "⬜ ") + label, callback_data=f"netpanel:permtoggle:{manager_id}:{k}")] for k, label in BOT_MANAGER_PERMISSIONS.items()]
+        rows.append([InlineKeyboardButton("⬅️ Managers", callback_data="netpanel:managers")])
+        await q.edit_message_text(f"⚙️ <b>Manager permissions</b>\nUser: <code>{manager_id}</code>\nChanges apply immediately.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif action == "permtoggle" and len(data) == 4 and data[2].isdigit():
+        manager_id, key = int(data[2]), data[3]
+        if key not in BOT_MANAGER_PERMISSIONS: return
+        manager = await bot_managers_col.find_one({"bot_id": bot_id, "user_id": manager_id})
+        if not manager: await q.answer("Manager not found", show_alert=True); return
+        perms = manager.get("permissions", {k: True for k in BOT_MANAGER_PERMISSIONS})
+        perms[key] = not bool(perms.get(key, False))
+        await bot_managers_col.update_one({"bot_id": bot_id, "user_id": manager_id}, {"$set": {f"permissions.{key}": perms[key]}})
+        rows = [[InlineKeyboardButton(("✅ " if perms.get(k, False) else "⬜ ") + label, callback_data=f"netpanel:permtoggle:{manager_id}:{k}")] for k, label in BOT_MANAGER_PERMISSIONS.items()]
+        rows.append([InlineKeyboardButton("⬅️ Managers", callback_data="netpanel:managers")])
+        await q.edit_message_text(f"⚙️ <b>Manager permissions</b>\nUser: <code>{manager_id}</code>\nUpdated immediately.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
     elif action == "managerdel" and len(data) == 3 and data[2].isdigit():
         await bot_managers_col.delete_one({"bot_id": bot_id, "user_id": int(data[2])})
         await q.edit_message_text("✅ Manager removed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛠 Managers", callback_data="netpanel:managers")], [InlineKeyboardButton("🏠 Main menu", callback_data="netpanel:home")]]))
@@ -965,10 +1024,13 @@ async def _bot_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         }
         await q.edit_message_text(prompts.get(data[2], "Send the requested value now.") + "\nSend /cancel to stop.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="netpanel:home")]]))
     else:
-        await q.edit_message_text("🎛 <b>Owner Control Center</b>", parse_mode="HTML", reply_markup=_panel_home_markup())
+        await q.edit_message_text("🎛 <b>Owner Control Center</b>", parse_mode="HTML", reply_markup=_panel_home_markup(is_owner=True, bot_id=bot_id, user_id=q.from_user.id))
 
 
 async def _bot_panel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Control Center text prompts are private-chat workflows; ignore group chatter.
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return
     action = context.user_data.get("netpanel_action")
     if not action or not update.effective_user:
         return
@@ -979,6 +1041,11 @@ async def _bot_panel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     value = (msg.text or "").strip()
     bot_id = int(context.bot.id)
+    text_permission = {"autodel":"manage_autodel", "welcome":"edit_welcome", "channel":"edit_channel", "addfjoin":"manage_fjoin", "broadcast":"broadcast", "broadcast_media":"broadcast"}.get(action)
+    if text_permission and update.effective_user.id != int(doc["owner_id"]) and not await _bot_manager_has_permission(bot_id, update.effective_user.id, text_permission):
+        context.user_data.pop("netpanel_action", None)
+        await msg.reply_text("You no longer have permission for this action.")
+        return
     if action == "addmanager" and update.effective_user.id != int(doc["owner_id"]):
         context.user_data.pop("netpanel_action", None)
         await msg.reply_text("Only this bot's owner can add managers.")
@@ -1005,7 +1072,7 @@ async def _bot_panel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not value.isdigit(): await msg.reply_text("Send a numeric Telegram user ID."); return
         uid = int(value)
         if uid == int(doc["owner_id"]): await msg.reply_text("The owner already has full access."); return
-        await bot_managers_col.update_one({"bot_id": bot_id, "user_id": uid}, {"$set": {"bot_id": bot_id, "user_id": uid, "added_by": update.effective_user.id, "added_at": datetime.now(timezone.utc)}}, upsert=True)
+        await bot_managers_col.update_one({"bot_id": bot_id, "user_id": uid}, {"$set": {"bot_id": bot_id, "user_id": uid, "added_by": update.effective_user.id, "added_at": datetime.now(timezone.utc), "permissions": {"upload_files": True}}}, upsert=True)
         result = f"✅ User {uid} is now a manager."
     elif action == "addfjoin":
         if not value.lstrip("-").isdigit(): await msg.reply_text("Send a valid numeric channel ID."); return
@@ -1073,6 +1140,8 @@ async def _bot_error(update, context):
 
 
 async def handle_network_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return False
     if not update.effective_user or not update.message or not context.user_data.get("network_await_token"):
         return False
     uid = update.effective_user.id
@@ -1339,10 +1408,34 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_id = int(data.rsplit("_", 1)[1]); b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
         if not b: return
         managers = await bot_managers_col.find({"bot_id": bot_id}).to_list(None)
-        rows = [[InlineKeyboardButton(f"❌ Remove {m['user_id']}", callback_data=f"network_delmanager_{bot_id}_{m['user_id']}")] for m in managers]
+        rows = [[InlineKeyboardButton(f"⚙️ {m['user_id']} permissions", callback_data=f"network_managerperms_{bot_id}_{m['user_id']}"), InlineKeyboardButton("❌", callback_data=f"network_delmanager_{bot_id}_{m['user_id']}")] for m in managers]
         rows += [[InlineKeyboardButton("➕ Add Manager", callback_data=f"network_addmanager_{bot_id}")], [InlineKeyboardButton("⬅️ Back", callback_data=f"network_manage_{bot_id}")]]
         text = "👥 <b>Bot Managers</b>\n\n" + ("\n".join(f"• <code>{m['user_id']}</code>" for m in managers) if managers else "No managers added.")
         await q.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif data.startswith("network_managerperms_"):
+        parts = data.split("_")
+        try: bot_id, manager_id = int(parts[2]), int(parts[3])
+        except (ValueError, IndexError): return
+        b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
+        manager = await bot_managers_col.find_one({"bot_id": bot_id, "user_id": manager_id}) if b else None
+        if not manager: await q.message.reply_text("Manager not found or this bot is not yours."); return
+        perms = manager.get("permissions", {k: True for k in BOT_MANAGER_PERMISSIONS})
+        rows = [[InlineKeyboardButton(("✅ " if perms.get(k, False) else "⬜ ") + label, callback_data=f"network_permtoggle_{bot_id}_{manager_id}_{k}")] for k, label in BOT_MANAGER_PERMISSIONS.items()]
+        rows.append([InlineKeyboardButton("⬅️ Managers", callback_data=f"network_managers_{bot_id}")])
+        await q.message.reply_text(f"⚙️ <b>Manager permissions</b>\nBot: @{html.escape(str(b.get('username','bot')))}\nUser: <code>{manager_id}</code>\nChanges apply immediately.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif data.startswith("network_permtoggle_"):
+        parts = data.split("_")
+        try: bot_id, manager_id = int(parts[2]), int(parts[3]); key = parts[4]
+        except (ValueError, IndexError): return
+        b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
+        manager = await bot_managers_col.find_one({"bot_id": bot_id, "user_id": manager_id}) if b else None
+        if not manager or key not in BOT_MANAGER_PERMISSIONS: return
+        perms = manager.get("permissions", {k: True for k in BOT_MANAGER_PERMISSIONS})
+        perms[key] = not bool(perms.get(key, False))
+        await bot_managers_col.update_one({"bot_id": bot_id, "user_id": manager_id}, {"$set": {f"permissions.{key}": perms[key]}})
+        rows = [[InlineKeyboardButton(("✅ " if perms.get(k, False) else "⬜ ") + label, callback_data=f"network_permtoggle_{bot_id}_{manager_id}_{k}")] for k, label in BOT_MANAGER_PERMISSIONS.items()]
+        rows.append([InlineKeyboardButton("⬅️ Managers", callback_data=f"network_managers_{bot_id}")])
+        await q.edit_message_text(f"⚙️ <b>Manager permissions</b>\nUser: <code>{manager_id}</code>\nUpdated immediately.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
     elif data.startswith("network_addmanager_"):
         bot_id = int(data.rsplit("_", 1)[1]); b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
         if not b: return
@@ -1408,6 +1501,9 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Send the new token generated by @BotFather for this SAME bot. Its Telegram bot ID must remain unchanged.")
 
 async def network_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Main-bot setup and management prompts must never consume group conversation.
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return False
     if not update.effective_user or not update.message:
         return False
     submit_bot_id = context.user_data.get("network_await_submit_username")
@@ -1532,6 +1628,8 @@ async def network_text_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def network_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return
     context.user_data.pop("network_await_token",None)
     context.user_data.pop("network_await_submit_username",None)
     context.user_data.pop("network_action",None)
@@ -1583,8 +1681,8 @@ async def _bot_verify_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def register_network_handlers(app):
     app.add_handler(CallbackQueryHandler(network_callback, pattern=r"^network_"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, network_text_message), group=0)
-    app.add_handler(CommandHandler("cancel", network_cancel))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, network_text_message), group=0)
+    app.add_handler(CommandHandler("cancel", network_cancel, filters=filters.ChatType.PRIVATE))
 
 
 async def cmd_network_fsub_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
