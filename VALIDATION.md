@@ -17,3 +17,18 @@
 ## Local checks
 
 Python syntax compilation and static callback checks were performed. Live service and production integration tests were not performed in this environment. Run the checklist above with test accounts before deploying to production.
+
+
+## Gudu AI checks
+
+1. Set the AI service credential and restart the service.
+2. Start AI chat with `/ai` in the main bot and in a connected Member bot.
+3. Confirm ordinary users can chat but cannot perform management actions.
+4. Confirm each manager can perform only actions covered by their current permissions.
+5. Confirm read-only requests run without an approval prompt.
+6. Confirm file removal, broadcasts, access changes, and configuration changes require explicit confirmation.
+7. Revoke a manager permission, then confirm the same action is denied immediately, including at confirmation time.
+8. Use `/aistop` and confirm AI chat pauses.
+9. Test unavailable AI service responses and request rate limiting.
+
+Local AI helper unit tests cover missing credentials, allow-listed actions, unknown-action rejection, privacy instructions, and request throttling. External AI service and live Telegram integration were not tested in this environment.

@@ -5,6 +5,7 @@ import re
 import uuid
 import secrets
 import string
+import time
 from datetime import datetime, timedelta, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,9 +18,10 @@ from config import (
     DB_URI, DB_NAME, DB_CHANNEL, AUTO_DEL,
     START_PHOTO, FSUB_PHOTO, DEFAULT_MESSAGES,
 )
+from ai_assistant import create_ai_plan, rate_limited
 from network import (
     startup_network_bots, shutdown_network_bots, network_callback,
-    network_text_message, cmd_network_fsub_add, cmd_network_fsub_remove,
+    network_text_message, cmd_network_fsub_add, cmd_network_fsub_remove, _delete_bot_data,
     cmd_network_fsub_list, network_cancel, cmd_botverifyqueue, cmd_setbotverifier,
 )
 
@@ -810,6 +812,8 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/getkey — Get Free Key\n"
         "/mykey — My Key Info\n"
         "/resetkey — Reset Devices (one key can be used on one device)\n"
+        "/ai — Chat with Gudu AI\n"
+        "/aistop — Pause AI chat\n"
         "/help — Help\n\n"
         "Any issue? Contact • @subro98 / @gudugaming8069"
     )
@@ -883,7 +887,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (is_owner or is_manager):
         return
     if is_manager and not is_owner:
-        rows = []
+        rows = [[InlineKeyboardButton("🤖 Chat with Gudu AI", callback_data="adm_ai")]]
         for permission, label, callback in [
             ("view_stats", "📊 Overview & Stats", "adm_stats"),
             ("manage_files", "📦 Manage / Delete Files", "adm_listfiles"),
@@ -925,6 +929,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Select a management section:"
     )
     btns = [
+        [InlineKeyboardButton("🤖 Chat with Gudu AI", callback_data="adm_ai")],
         [InlineKeyboardButton("📊 Overview & Stats", callback_data="adm_stats")],
         [InlineKeyboardButton("🛠 Manager Management (AdminGG)", callback_data="adm_managers")],
         [InlineKeyboardButton("🤖 Bot Verifiers", callback_data="adm_bot_verifiers")],
@@ -979,12 +984,18 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for prefixes, permission in callback_permissions
             for prefix in prefixes
         )
-        if not allowed:
+        if not allowed and d != "adm_ai":
             await q.answer("You do not have permission for this section.", show_alert=True)
             return
     await q.answer()
 
-    if d == "adm_bot_verifiers":
+    if d == "adm_ai":
+        context.user_data["gudu_ai_enabled"] = True
+        context.user_data.pop("gudu_ai_pending", None)
+        context.user_data.pop("gudu_ai_pending_at", None)
+        await q.edit_message_text("🤖 <b>Gudu AI chat is active.</b>\nSend your request here. Use /aistop to pause AI chat.", parse_mode="HTML")
+
+    elif d == "adm_bot_verifiers":
         verifier_doc = await _db["network_settings"].find_one({"_id": "bot_verifiers"}) or {}
         verifier_ids = list(verifier_doc.get("ids", [None, None]))
         while len(verifier_ids) < 2: verifier_ids.append(None)
@@ -1797,6 +1808,193 @@ async def error_handler(update, context):
         logging.exception("Could not send the update-error notice to the user")
 
 
+# ------------------------------ Gudu AI ---------------------------------
+MAIN_AI_ACTIONS = {
+    "get_stats": ("Show the main bot's user, file and active-key totals.", "view_stats"),
+    "list_member_bots": ("List connected customer bots with their IDs and statuses. Super Admin only.", "super_admin"),
+    "delete_member_bot": ("Permanently disconnect and delete a connected bot by numeric bot_id. Super Admin only.", "super_admin"),
+    "list_files": ("List recent files. Requires file-management access.", "manage_files"),
+    "delete_file": ("Permanently remove a file by its exact share token.", "manage_files"),
+    "list_force_subscribe": ("List configured mandatory subscription channels.", "manage_fsub"),
+    "add_force_subscribe": ("Add a channel using numeric channel_id.", "manage_fsub"),
+    "remove_force_subscribe": ("Remove a channel using numeric channel_id.", "manage_fsub"),
+    "set_auto_delete": ("Set auto-delete duration in seconds (30-86400).", "manage_autodel"),
+    "set_welcome": ("Replace the main bot welcome message with supplied text.", "edit_messages"),
+    "broadcast": ("Send a text announcement to all users. args: text.", "broadcast"),
+    "ban_user": ("Ban a user by numeric Telegram user_id.", "manage_users"),
+    "unban_user": ("Unban a user by numeric Telegram user_id.", "manage_users"),
+}
+MAIN_AI_CONFIRM = {"delete_member_bot", "delete_file", "add_force_subscribe", "remove_force_subscribe", "set_auto_delete", "set_welcome", "broadcast", "ban_user", "unban_user"}
+
+async def main_ai_start(update, context):
+    context.user_data["gudu_ai_enabled"] = True
+    context.user_data.pop("gudu_ai_pending", None)
+    context.user_data.pop("gudu_ai_pending_at", None)
+    await update.effective_message.reply_text("🤖 Gudu AI is ready. Tell me what you need in natural language.\nUse /aistop to leave AI chat. Sensitive actions require confirmation.")
+
+async def main_ai_stop(update, context):
+    context.user_data["gudu_ai_enabled"] = False
+    context.user_data.pop("gudu_ai_pending", None)
+    context.user_data.pop("gudu_ai_pending_at", None)
+    context.user_data.pop("gudu_ai_history", None)
+    await update.effective_message.reply_text("Gudu AI chat paused. Use /ai whenever you want to chat again.")
+
+async def _main_ai_allowed_actions(uid):
+    allowed = {}
+    for name, (description, permission) in MAIN_AI_ACTIONS.items():
+        if permission == "super_admin":
+            if _is_admin(uid): allowed[name] = description
+        elif permission is None or await _manager_has_permission(uid, permission):
+            allowed[name] = description
+    return allowed
+
+async def _main_ai_execute(update, context, action):
+    uid = update.effective_user.id
+    name, args = action.get("name"), action.get("args", {})
+    if name not in await _main_ai_allowed_actions(uid):
+        return "⛔ Your access does not allow that action."
+    if name == "get_stats":
+        return f"📊 Main bot statistics\nUsers: {await db_user_count()}\nFiles: {await db_file_count()}\nActive keys: {await db_active_key_count()}"
+    if name == "list_member_bots":
+        bots = await _db["network_bots"].find({}, {"_id": 1, "username": 1, "status": 1, "owner_id": 1}).sort("created_at", -1).limit(25).to_list(25)
+        if not bots: return "No connected bots were found."
+        return "🤖 Connected bots\n" + "\n".join(f"• @{html.escape(str(b.get('username') or 'unknown'))} — ID <code>{int(b['_id'])}</code> — {html.escape(str(b.get('status','unknown')))}" for b in bots)
+    if name == "delete_member_bot":
+        raw = args.get("bot_id")
+        if isinstance(raw, bool) or not str(raw).isdigit(): return "Please provide a numeric bot_id. Nothing was deleted."
+        bot_id = int(raw)
+        bot_doc = await _db["network_bots"].find_one({"_id": bot_id})
+        if not bot_doc: return "That connected bot could not be found."
+        deleted = await _delete_bot_data(bot_id, bot_doc.get("owner_id"))
+        return "✅ Bot disconnected and deleted." if deleted else "The bot could not be deleted. Please check its current status."
+    if name == "list_files":
+        docs = await db_list_files(10)
+        if not docs: return "No files are currently listed."
+        return "📁 Recent files\n" + "\n".join(f"• {html.escape(str(x.get('file_name','File')))} — <code>{html.escape(str(x.get('_id','')))}</code>" for x in docs)
+    if name == "delete_file":
+        token = str(args.get("token", "")).strip()
+        if not token or len(token) > 150: return "Please provide the exact share token. No file was removed."
+        doc = await db_get_file(token)
+        if not doc: return "That file could not be found."
+        try: await context.bot.delete_message(DB_CHANNEL, int(doc["message_id"]))
+        except Exception: pass
+        await db_del_file(token)
+        return "🗑 File removed successfully."
+    if name == "list_force_subscribe":
+        channels = await db_get_fsub()
+        if not channels: return "No mandatory subscription channels are configured."
+        return "📢 Configured channels\n" + "\n".join(f"• {html.escape(str(c.get('title','Channel')))} — <code>{int(c['_id'])}</code>" for c in channels[:30])
+    if name == "add_force_subscribe":
+        raw = args.get("channel_id")
+        if isinstance(raw, bool) or not str(raw).lstrip('-').isdigit(): return "Please provide a numeric channel_id. No change was made."
+        channel_id = int(raw)
+        try:
+            chat = await context.bot.get_chat(channel_id)
+            member = await context.bot.get_chat_member(channel_id, context.bot.id)
+            if str(member.status).lower() not in ("administrator", "creator"): return "The bot must be an administrator in that channel. No change was made."
+            invite, title = await get_channel_invite(context, channel_id)
+            if not invite: return "I couldn't create a usable channel link. No change was made."
+            await db_add_fsub(channel_id, title or chat.title or str(channel_id), invite)
+            return f"✅ {html.escape(str(title or chat.title or channel_id))} added to mandatory subscription."
+        except Exception: return "Could not add that channel. Check its ID and the bot's channel permissions."
+    if name == "remove_force_subscribe":
+        raw = args.get("channel_id")
+        if isinstance(raw, bool) or not str(raw).lstrip('-').isdigit(): return "Please provide a numeric channel_id. No change was made."
+        result = await fsub_col.delete_one({"_id": int(raw)})
+        return "✅ Channel removed." if result.deleted_count else "That channel was not found."
+    if name == "set_auto_delete":
+        value = args.get("seconds")
+        if isinstance(value, bool) or not str(value).isdigit() or not 30 <= int(value) <= 86400: return "Use auto-delete seconds between 30 and 86400. No change was made."
+        await db_set_setting("auto_del", int(value)); return f"✅ Auto-delete updated to {_fmt_del(int(value))}."
+    if name == "set_welcome":
+        value = str(args.get("text", "")).strip()
+        if not value or len(value) > 3500: return "Welcome text must be 1-3500 characters. No change was made."
+        await db_save_msg("START", value); return "✅ Welcome message updated."
+    if name == "broadcast":
+        body = str(args.get("text", "")).strip()
+        if not body or len(body) > 3500: return "Broadcast text must be 1-3500 characters. Nothing was sent."
+        targets = await db_all_users(); sent = failed = 0
+        status = await update.effective_message.reply_text(f"Preparing broadcast to {len(targets)} users…")
+        for target in targets:
+            try: await context.bot.send_message(int(target["_id"]), body); sent += 1
+            except Exception: failed += 1
+            await asyncio.sleep(0.04)
+        await status.edit_text(f"📣 Broadcast complete\nSent: {sent}\nFailed: {failed}"); return None
+    if name in ("ban_user", "unban_user"):
+        target = args.get("user_id")
+        if isinstance(target, bool) or not str(target).isdigit(): return "Please provide a numeric user_id. No change was made."
+        target = int(target)
+        if target == OWNER_ID or await _is_manager(target): return "The bot owner and AdminGG managers cannot be changed by this action."
+        if name == "ban_user": await db_ban(target); return f"🚫 User {target} has been banned."
+        await db_unban(target); return f"✅ User {target} has been unbanned."
+    return "I couldn't perform that action."
+
+def _main_ai_confirmation_summary(action):
+    name, args = action.get("name"), action.get("args", {})
+    if name == "delete_member_bot": return f"Target bot ID: {args.get('bot_id', 'not provided')}\nThis permanently removes that bot."
+    if name == "delete_file": return f"File token: {args.get('token', 'not provided')}\nThis permanently removes the selected file."
+    if name == "broadcast": return "Broadcast preview:\n" + str(args.get("text", ""))[:1200]
+    if name == "set_welcome": return "New welcome message:\n" + str(args.get("text", ""))[:1200]
+    if name == "set_auto_delete": return f"New duration: {args.get('seconds', 'not provided')} seconds"
+    if name in ("ban_user", "unban_user"): return f"Target user ID: {args.get('user_id', 'not provided')}"
+    if name in ("add_force_subscribe", "remove_force_subscribe"): return f"Channel ID: {args.get('channel_id', 'not provided')}"
+    return "Please review the requested change before confirming."
+
+async def main_ai_message(update, context):
+    if not context.user_data.get("gudu_ai_enabled") or not update.effective_message or not update.effective_user: return
+    if any(context.user_data.get(k) for k in ("network_action", "network_await_submit_username", "network_await_token", "netpanel_action")): return
+    if context.user_data.get("gudu_ai_pending"):
+        if time.time() - context.user_data.get("gudu_ai_pending_at", 0) > 300:
+            context.user_data.pop("gudu_ai_pending", None); context.user_data.pop("gudu_ai_pending_at", None)
+        else:
+            await update.effective_message.reply_text("Please confirm or cancel the pending action before sending another request."); return
+    if rate_limited(context.user_data):
+        await update.effective_message.reply_text("You're sending requests too quickly. Please wait a minute and try again."); return
+    uid = update.effective_user.id
+    actions = await _main_ai_allowed_actions(uid)
+    role = "Super Admin" if _is_admin(uid) else "AdminGG manager" if await _is_manager(uid) else "user"
+    history = context.user_data.setdefault("gudu_ai_history", [])
+    try:
+        plan = await create_ai_plan(update.effective_message.text or "", history, actions, role)
+    except RuntimeError as exc:
+        if str(exc) == "AI_NOT_CONFIGURED": await update.effective_message.reply_text("AI is not configured yet. Please contact the bot owner."); return
+        await update.effective_message.reply_text("AI is temporarily unavailable. Please try again later."); return
+    except Exception:
+        logging.exception("Gudu AI request failed")
+        await update.effective_message.reply_text("AI is temporarily unavailable. Please try again later."); return
+    history.extend([{"role": "user", "content": update.effective_message.text or ""}, {"role": "assistant", "content": plan["reply"]}])
+    context.user_data["gudu_ai_history"] = history[-16:]
+    action = plan.get("action")
+    if not action:
+        await update.effective_message.reply_text(plan["reply"] or "How can I help?"); return
+    if action["name"] in MAIN_AI_CONFIRM:
+        context.user_data["gudu_ai_pending"] = action
+        context.user_data["gudu_ai_pending_at"] = time.time()
+        summary = _main_ai_confirmation_summary(action)
+        await update.effective_message.reply_text((plan["reply"] + "\n\n" + summary + "\n\nDo you want me to proceed?").strip(), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm", callback_data="gai:confirm"), InlineKeyboardButton("Cancel", callback_data="gai:cancel")]])); return
+    result = await _main_ai_execute(update, context, action)
+    history.append({"role": "assistant", "content": result or "The requested action was completed."})
+    context.user_data["gudu_ai_history"] = history[-16:]
+    if result: await update.effective_message.reply_text(result, parse_mode="HTML")
+
+async def main_ai_callback(update, context):
+    q = update.callback_query
+    if not q: return
+    await q.answer(); pending = context.user_data.get("gudu_ai_pending")
+    if q.data == "gai:cancel":
+        context.user_data.pop("gudu_ai_pending", None); context.user_data.pop("gudu_ai_pending_at", None); await q.edit_message_text("Action cancelled. Nothing was changed."); return
+    if q.data != "gai:confirm" or not pending:
+        await q.edit_message_text("This confirmation has expired. Please ask Gudu AI again."); return
+    if time.time() - context.user_data.get("gudu_ai_pending_at", 0) > 300:
+        context.user_data.pop("gudu_ai_pending", None); context.user_data.pop("gudu_ai_pending_at", None)
+        await q.edit_message_text("This confirmation expired. Please ask Gudu AI again."); return
+    context.user_data.pop("gudu_ai_pending", None); context.user_data.pop("gudu_ai_pending_at", None)
+    result = await _main_ai_execute(update, context, pending)
+    history = context.user_data.setdefault("gudu_ai_history", [])
+    history.append({"role": "assistant", "content": result or "The requested action was completed."})
+    context.user_data["gudu_ai_history"] = history[-16:]
+    await q.edit_message_text(result or "✅ Action completed.", parse_mode="HTML")
+
 async def post_init(app):
     await startup_network_bots()
     await app.bot.set_my_commands([
@@ -1805,6 +2003,8 @@ async def post_init(app):
         BotCommand("getkey", "Generate a free 1-day key"),
         BotCommand("mykey", "View your key information"),
         BotCommand("resetkey", "Reset your key device list"),
+        BotCommand("ai", "Chat with Gudu AI"),
+        BotCommand("aistop", "Pause Gudu AI chat"),
     ])
 
 
@@ -1816,6 +2016,8 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
 
     app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("ai", main_ai_start))
+    app.add_handler(CommandHandler("aistop", main_ai_stop))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CommandHandler("getkey", getkey_handler))
     app.add_handler(CommandHandler("mykey", mykey_handler))
@@ -1851,7 +2053,9 @@ def main():
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
     app.add_handler(CommandHandler("delfile", cmd_delfile))
+    app.add_handler(CallbackQueryHandler(main_ai_callback, pattern=r"^gai:"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^adm_"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, main_ai_message), group=1)
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO,
         file_handler,

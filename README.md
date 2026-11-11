@@ -11,7 +11,8 @@ A Telegram file-sharing and multi-bot management platform. Create shareable link
 - Broadcast and editable bot messages
 - Separate owner and manager dashboards
 - Individually configurable manager permissions
-- Central administration for connected bots
+- Central administration for connected bots, including AI-assisted bot oversight
+- Optional Gudu AI chat for natural-language help and permitted management actions
 - A single **Disconnect / Delete Bot** action with confirmation
 
 ## Roles
@@ -20,6 +21,10 @@ A Telegram file-sharing and multi-bot management platform. Create shareable link
 - **AdminGG Manager:** receives only the individual permissions granted by Super Admin.
 - **Member:** manages their own connected bot or bots.
 - **Member Bot Manager:** manages only the bot(s) and actions assigned by its owner.
+
+## Gudu AI
+
+Users can start an AI conversation with `/ai` and pause it with `/aistop`. The assistant can answer questions and perform permitted tasks, including viewing summaries, finding files, updating selected settings, managing subscription requirements, and managing user access. Read-only requests can run directly; file removal, broadcasts, user access changes, and settings updates require an explicit confirmation. Managers can only use actions allowed by their assigned permissions. AI access requires an AI service credential and can be configured through the private deployment settings. Do not send passwords, access tokens, or other secrets in AI conversations.
 
 ## Deployment
 

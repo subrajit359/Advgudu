@@ -1,9 +1,4 @@
-"""Multi-tenant Gudu Gaming custom file-share bots.
-
-Each customer bot forwards uploaded Telegram messages into one private storage
-channel. The customer bot must be an administrator of that channel. MongoDB
-stores metadata only; file payloads stay in Telegram.
-"""
+"""Runtime support for Gudu Gaming connected customer bots."""
 import asyncio
 import html
 import logging
@@ -11,6 +6,7 @@ import os
 import re
 import secrets
 import string
+import time
 from datetime import datetime, timezone
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -23,6 +19,7 @@ from telegram.ext import (
 )
 
 from config import BOT_TOKEN, DB_URI, DB_NAME
+from ai_assistant import create_ai_plan, rate_limited
 
 log = logging.getLogger(__name__)
 client = AsyncIOMotorClient(DB_URI, tz_aware=True)
@@ -127,11 +124,7 @@ async def _stop_runtime(bot_id):
 
 
 async def _delete_bot_data(bot_id, owner_id=None):
-    """Stop one customer bot and permanently remove only its database records.
-
-    Telegram storage-channel messages are intentionally retained; only MongoDB
-    metadata/configuration and the encrypted bot registration are deleted.
-    """
+    """Stop one customer bot and permanently remove only its associated records."""
     bot_id = int(bot_id)
     await _stop_runtime(bot_id)
     # Telegram bot ID is globally unique; every child document is tenant-scoped
@@ -242,6 +235,8 @@ async def _start_runtime(doc):
         token = _decrypt(doc["token_enc"])
         app = ApplicationBuilder().token(token).build()
         app.add_handler(CommandHandler("start", _bot_start))
+        app.add_handler(CommandHandler("ai", network_ai_start))
+        app.add_handler(CommandHandler("aistop", network_ai_stop))
         app.add_handler(CommandHandler("help", _bot_help))
         app.add_handler(CommandHandler("myaccount", cmd_bot_myaccount))
         app.add_handler(CommandHandler("panel", cmd_bot_panel))
@@ -261,7 +256,9 @@ async def _start_runtime(doc):
         app.add_handler(CallbackQueryHandler(_bot_verify_callback, pattern=r"^netverify:"))
         app.add_handler(CallbackQueryHandler(_bot_account_callback, pattern=r"^netaccount$"))
         app.add_handler(CallbackQueryHandler(_bot_panel_callback, pattern=r"^netpanel:"))
-        app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, _bot_panel_text))
+        app.add_handler(CallbackQueryHandler(network_ai_callback, pattern=r"^netai:"))
+        app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, _bot_panel_text), group=0)
+        app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, network_ai_message), group=1)
         app.add_handler(MessageHandler(
             filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO,
             _bot_upload,
@@ -281,6 +278,8 @@ async def _start_runtime(doc):
                 # as a long command list to ordinary bot users.
                 await app.bot.set_my_commands([
                     BotCommand("start", "Start the bot / open shared files"),
+                    BotCommand("ai", "Chat with Gudu AI"),
+                    BotCommand("aistop", "Pause Gudu AI chat"),
                 ])
             except Exception:
                 log.warning("Could not set command menu for customer bot %s", bot_id)
@@ -456,8 +455,9 @@ async def _bot_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = await _lookup_bot(context)
     owner = bool(doc and update.effective_user and update.effective_user.id == int(doc["owner_id"]))
     text = "Open a share link to receive a file. Only the bot owner and approved managers can upload files."
+    text += "\n\nUse /ai to chat with Gudu AI and /aistop to pause AI chat."
     if owner:
-        text += "\n\nUse the 🎛 Control Center button in /start to manage your bot."
+        text += "\nUse the 🎛 Control Center button in /start to manage your bot."
     await update.effective_message.reply_text(text)
 
 
@@ -626,7 +626,7 @@ async def _bot_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Your file is ready!\n\n📄 {fname}\n💾 {_fmt_size(size)}\n🔗 Share link:\n{link}"
         )
     except Exception:
-        log.error("Could not forward custom bot upload to network storage channel")
+        log.error("Could not complete file upload for connected bot")
         await msg.reply_text("❌ Upload failed. Please try again later or contact support.")
 
 
@@ -845,7 +845,7 @@ async def cmd_bot_myaccount(update, context):
         f"🤖 Bots: <b>{len(bot_ids)}</b>\n🛠 Managers: <b>{managers}</b>", parse_mode="HTML")
 
 async def _panel_home_markup(is_owner=True, bot_id=None, user_id=None):
-    rows = []
+    rows = [[InlineKeyboardButton("🤖 Chat with Gudu AI", callback_data="netpanel:ai")]]
     if is_owner or await _bot_manager_has_permission(bot_id, user_id, "view_stats"):
         rows.append([InlineKeyboardButton("📊 My Account", callback_data="netpanel:account")])
     if is_owner or await _bot_manager_has_permission(bot_id, user_id, "manage_files"):
@@ -925,7 +925,12 @@ async def _bot_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await q.answer("You do not have permission for this action.", show_alert=True); return
     if (action in ("managers", "managerdel", "managerperms", "permtoggle") or (action == "prompt" and len(data) == 3 and data[2] == "addmanager")) and not is_owner:
         return
-    if action == "home":
+    if action == "ai":
+        context.user_data["gudu_ai_enabled"] = True
+        context.user_data.pop("gudu_ai_pending", None)
+        context.user_data.pop("gudu_ai_pending_at", None)
+        await q.edit_message_text("🤖 <b>Gudu AI chat is active.</b>\nSend your request here. Use /aistop to pause AI chat.", parse_mode="HTML")
+    elif action == "home":
         title = "Owner Control Center" if is_owner else "Manager Control Center"
         await q.edit_message_text(f"🎛 <b>{title}</b>\n@{context.bot.username}", reply_markup=_panel_home_markup(is_owner=is_owner, bot_id=bot_id, user_id=q.from_user.id), parse_mode="HTML")
     elif action == "account":
@@ -1147,6 +1152,199 @@ async def _bot_panel_broadcast_media(update: Update, context: ContextTypes.DEFAU
     context.user_data.pop("netpanel_action", None)
     await status.edit_text(f"📡 Media broadcast complete\n✅ Sent: {sent}\n❌ Failed: {failed}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎛 Open Control Center", callback_data="netpanel:home")]]))
 
+
+# --------------------------- Gudu AI assistant ---------------------------
+NETWORK_AI_ACTIONS = {
+    "get_stats": ("Show this bot's user, file and download totals.", "view_stats"),
+    "list_files": ("List recent files for this bot.", "manage_files"),
+    "delete_file": ("Permanently remove a file by its exact share token.", "manage_files"),
+    "list_force_join": ("List this bot's own mandatory join channels.", "manage_fjoin"),
+    "add_force_join": ("Add a channel using numeric channel_id.", "manage_fjoin"),
+    "remove_force_join": ("Remove a channel using numeric channel_id.", "manage_fjoin"),
+    "list_users": ("Show the number of users for this bot.", "view_users"),
+    "set_auto_delete": ("Set auto-delete seconds from 30 to 86400.", "manage_autodel"),
+    "set_welcome": ("Change this bot's welcome message. args: text.", "edit_welcome"),
+    "set_channel": ("Set channel button. args: url and optional label.", "edit_channel"),
+    "broadcast": ("Send a text broadcast to this bot's users. args: text.", "broadcast"),
+    "ban_user": ("Ban a user from this bot by numeric user_id.", "manage_users"),
+    "unban_user": ("Unban a user from this bot by numeric user_id.", "manage_users"),
+}
+NETWORK_AI_CONFIRM = {"delete_file", "add_force_join", "remove_force_join", "set_auto_delete", "set_welcome", "set_channel", "broadcast", "ban_user", "unban_user"}
+
+async def network_ai_start(update, context):
+    context.user_data["gudu_ai_enabled"] = True
+    context.user_data.pop("gudu_ai_pending", None)
+    context.user_data.pop("gudu_ai_pending_at", None)
+    await update.effective_message.reply_text("🤖 Gudu AI is ready. Tell me what you need in natural language.\nUse /aistop to leave AI chat. Sensitive actions require confirmation.")
+
+async def network_ai_stop(update, context):
+    context.user_data["gudu_ai_enabled"] = False
+    context.user_data.pop("gudu_ai_pending", None)
+    context.user_data.pop("gudu_ai_pending_at", None)
+    context.user_data.pop("gudu_ai_history", None)
+    await update.effective_message.reply_text("Gudu AI chat paused. Use /ai whenever you want to chat again.")
+
+async def _network_ai_allowed_actions(bot_id, user_id, doc):
+    is_owner = int(user_id) == int(doc["owner_id"])
+    allowed = {}
+    for name, (description, permission) in NETWORK_AI_ACTIONS.items():
+        if is_owner or await _bot_manager_has_permission(bot_id, user_id, permission):
+            allowed[name] = description
+    return allowed
+
+async def _network_ai_execute(update, context, action):
+    doc = await _lookup_bot(context)
+    if not doc or not update.effective_user: return "This bot is no longer available."
+    bot_id, uid = int(context.bot.id), int(update.effective_user.id)
+    args, name = action.get("args", {}), action.get("name")
+    if name not in await _network_ai_allowed_actions(bot_id, uid, doc):
+        return "⛔ Your access does not allow that action."
+    if name == "get_stats":
+        users = await users_col.count_documents({"bot_id": bot_id})
+        files = await files_col.count_documents({"bot_id": bot_id})
+        pipeline = [{"$match": {"bot_id": bot_id}}, {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$downloads", 0]}}}}]
+        rows = await users_col.aggregate(pipeline).to_list(1)
+        return f"📊 Bot statistics\nUsers: {users}\nFiles: {files}\nDownloads: {rows[0]['total'] if rows else 0}"
+    if name == "list_users":
+        return f"👥 This bot has {await users_col.count_documents({'bot_id': bot_id})} users."
+    if name == "list_files":
+        docs = await files_col.find({"bot_id": bot_id}, {"_id": 1, "file_name": 1}).sort("created_at", -1).limit(10).to_list(10)
+        if not docs: return "No files are currently listed."
+        return "📁 Recent files\n" + "\n".join(f"• {html.escape(str(x.get('file_name','File')))} — <code>{html.escape(str(x.get('_id','')))}</code>" for x in docs)
+    if name == "delete_file":
+        token = str(args.get("token", "")).strip()
+        if not token or len(token) > 150: return "Please provide the exact share token. No file was removed."
+        file_doc = await files_col.find_one({"_id": token, "bot_id": bot_id, "owner_id": int(doc["owner_id"])})
+        if not file_doc: return "That file could not be found for this bot."
+        try: await context.bot.delete_message(STORAGE_CHANNEL_ID, int(file_doc["storage_message_id"]))
+        except Exception: pass
+        await files_col.delete_one({"_id": token, "bot_id": bot_id, "owner_id": int(doc["owner_id"])})
+        return "🗑 File removed successfully."
+    if name == "list_force_join":
+        channels = await owner_fsub_col.find({"bot_id": bot_id, "owner_id": int(doc["owner_id"])}).to_list(None)
+        if not channels: return "No owner-configured Force Join channels are set."
+        return "🔒 Your Force Join channels\n" + "\n".join(f"• {html.escape(str(c.get('title','Channel')))} — <code>{int(c['_id'])}</code>" for c in channels[:30])
+    if name == "add_force_join":
+        raw = args.get("channel_id")
+        if isinstance(raw, bool) or not str(raw).lstrip('-').isdigit(): return "Please provide a numeric channel_id. No change was made."
+        channel_id = int(raw)
+        try:
+            chat = await _main_bot.get_chat(channel_id)
+            member = await _main_bot.get_chat_member(channel_id, _main_bot.id)
+            if _member_status_value(member) not in ("administrator", "creator"): return "The main bot must be an administrator in that channel. No change was made."
+            invite = f"https://t.me/{chat.username}" if chat.username else (await _main_bot.create_chat_invite_link(channel_id, name="Gudu Force Join")).invite_link
+            await owner_fsub_col.update_one({"bot_id": bot_id, "_id": channel_id}, {"$set": {"bot_id": bot_id, "owner_id": int(doc["owner_id"]), "title": chat.title or str(channel_id), "invite_link": invite}}, upsert=True)
+            return f"✅ {html.escape(str(chat.title or channel_id))} added to Force Join."
+        except Exception: return "Could not add that channel. Check its ID and the main bot's channel permissions."
+    if name == "remove_force_join":
+        raw = args.get("channel_id")
+        if isinstance(raw, bool) or not str(raw).lstrip('-').isdigit(): return "Please provide a numeric channel_id. No change was made."
+        result = await owner_fsub_col.delete_one({"bot_id": bot_id, "_id": int(raw), "owner_id": int(doc["owner_id"])})
+        return "✅ Force Join channel removed." if result.deleted_count else "That channel was not found in this bot's own list."
+    if name == "set_auto_delete":
+        value = args.get("seconds")
+        if isinstance(value, bool) or not str(value).isdigit() or not 30 <= int(value) <= 86400: return "Use auto-delete seconds between 30 and 86400. No change was made."
+        await bots_col.update_one({"_id": bot_id, "owner_id": int(doc["owner_id"])}, {"$set": {"auto_del": int(value)}})
+        return f"✅ Auto-delete updated to {_fmt_time(int(value))}."
+    if name == "set_welcome":
+        value = str(args.get("text", "")).strip()
+        if not value or len(value) > 3500: return "Welcome text must be 1-3500 characters. No change was made."
+        await bots_col.update_one({"_id": bot_id, "owner_id": int(doc["owner_id"])}, {"$set": {"welcome_text": value}})
+        return "✅ Welcome message updated."
+    if name == "set_channel":
+        url = str(args.get("url", "")).strip(); label = str(args.get("label", "📢 My Channel")).strip()[:50]
+        if not re.match(r"^https?://t\.me/(?:[A-Za-z0-9_]{5,}|\+[^\s]+)$", url): return "Please provide a valid Telegram channel link. No change was made."
+        await bots_col.update_one({"_id": bot_id, "owner_id": int(doc["owner_id"])}, {"$set": {"channel_url": url, "channel_button": label or "📢 My Channel"}})
+        return "✅ Channel button updated."
+    if name == "broadcast":
+        body = str(args.get("text", "")).strip()
+        if not body or len(body) > 3500: return "Broadcast text must be 1-3500 characters. Nothing was sent."
+        privileged = await _bot_privileged_ids(bot_id, doc["owner_id"])
+        targets = await users_col.find({"bot_id": bot_id, "user_id": {"$nin": privileged}}, {"user_id": 1}).to_list(None)
+        sent = failed = 0
+        for target in targets:
+            try: await context.bot.send_message(int(target["user_id"]), body); sent += 1
+            except Exception: failed += 1
+            await asyncio.sleep(0.04)
+        return f"📣 Broadcast complete\nSent: {sent}\nFailed: {failed}"
+    if name in ("ban_user", "unban_user"):
+        target = args.get("user_id")
+        if isinstance(target, bool) or not str(target).isdigit(): return "Please provide a numeric user_id. No change was made."
+        target = int(target)
+        if target in await _bot_privileged_ids(bot_id, doc["owner_id"]): return "The bot owner and managers cannot be changed by this action."
+        if name == "ban_user":
+            await bot_bans_col.update_one({"bot_id": bot_id, "user_id": target}, {"$set": {"bot_id": bot_id, "user_id": target, "banned_at": datetime.now(timezone.utc)}}, upsert=True)
+            return f"🚫 User {target} has been banned."
+        result = await bot_bans_col.delete_one({"bot_id": bot_id, "user_id": target})
+        return "✅ User unbanned." if result.deleted_count else "That user was not banned."
+    return "I couldn't perform that action."
+
+def _network_ai_confirmation_summary(action):
+    name, args = action.get("name"), action.get("args", {})
+    if name == "delete_file": return f"File token: {args.get('token', 'not provided')}\nThis permanently removes the selected file."
+    if name == "broadcast": return "Broadcast preview:\n" + str(args.get("text", ""))[:1200]
+    if name == "set_welcome": return "New welcome message:\n" + str(args.get("text", ""))[:1200]
+    if name == "set_auto_delete": return f"New duration: {args.get('seconds', 'not provided')} seconds"
+    if name == "set_channel": return f"Channel URL: {args.get('url', 'not provided')}\nButton label: {args.get('label', '📢 My Channel')}"
+    if name in ("ban_user", "unban_user"): return f"Target user ID: {args.get('user_id', 'not provided')}"
+    if name in ("add_force_join", "remove_force_join"): return f"Channel ID: {args.get('channel_id', 'not provided')}"
+    return "Please review the requested change before confirming."
+
+async def network_ai_message(update, context):
+    if not context.user_data.get("gudu_ai_enabled") or not update.effective_message or not update.effective_user: return
+    if any(context.user_data.get(k) for k in ("network_action", "network_await_submit_username", "network_await_token", "netpanel_action")): return
+    if context.user_data.get("gudu_ai_pending"):
+        if time.time() - context.user_data.get("gudu_ai_pending_at", 0) > 300:
+            context.user_data.pop("gudu_ai_pending", None); context.user_data.pop("gudu_ai_pending_at", None)
+        else:
+            await update.effective_message.reply_text("Please confirm or cancel the pending action before sending another request."); return
+    if rate_limited(context.user_data):
+        await update.effective_message.reply_text("You're sending requests too quickly. Please wait a minute and try again."); return
+    doc = await _lookup_bot(context)
+    if not doc: return
+    uid = update.effective_user.id
+    actions = await _network_ai_allowed_actions(context.bot.id, uid, doc)
+    role = "Bot owner" if uid == int(doc["owner_id"]) else "Bot manager" if await _is_bot_manager(context.bot.id, uid) else "user"
+    history = context.user_data.setdefault("gudu_ai_history", [])
+    try:
+        plan = await create_ai_plan(update.effective_message.text or "", history, actions, role)
+    except RuntimeError as exc:
+        if str(exc) == "AI_NOT_CONFIGURED": await update.effective_message.reply_text("AI is not configured yet. Please contact the bot owner."); return
+        await update.effective_message.reply_text("AI is temporarily unavailable. Please try again later."); return
+    except Exception:
+        log.exception("Gudu AI request failed"); await update.effective_message.reply_text("AI is temporarily unavailable. Please try again later."); return
+    history.extend([{"role": "user", "content": update.effective_message.text or ""}, {"role": "assistant", "content": plan["reply"]}])
+    context.user_data["gudu_ai_history"] = history[-16:]
+    action = plan.get("action")
+    if not action:
+        await update.effective_message.reply_text(plan["reply"] or "How can I help?"); return
+    if action["name"] in NETWORK_AI_CONFIRM:
+        context.user_data["gudu_ai_pending"] = action
+        context.user_data["gudu_ai_pending_at"] = time.time()
+        summary = _network_ai_confirmation_summary(action)
+        await update.effective_message.reply_text((plan["reply"] + "\n\n" + summary + "\n\nDo you want me to proceed?").strip(), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Confirm", callback_data="netai:confirm"), InlineKeyboardButton("Cancel", callback_data="netai:cancel")]])); return
+    result = await _network_ai_execute(update, context, action)
+    history.append({"role": "assistant", "content": result or "The requested action was completed."})
+    context.user_data["gudu_ai_history"] = history[-16:]
+    if result: await update.effective_message.reply_text(result, parse_mode="HTML")
+
+async def network_ai_callback(update, context):
+    q = update.callback_query
+    if not q: return
+    await q.answer(); pending = context.user_data.get("gudu_ai_pending")
+    if q.data == "netai:cancel":
+        context.user_data.pop("gudu_ai_pending", None); context.user_data.pop("gudu_ai_pending_at", None); await q.edit_message_text("Action cancelled. Nothing was changed."); return
+    if q.data != "netai:confirm" or not pending:
+        await q.edit_message_text("This confirmation has expired. Please ask Gudu AI again."); return
+    if time.time() - context.user_data.get("gudu_ai_pending_at", 0) > 300:
+        context.user_data.pop("gudu_ai_pending", None); context.user_data.pop("gudu_ai_pending_at", None)
+        await q.edit_message_text("This confirmation expired. Please ask Gudu AI again."); return
+    context.user_data.pop("gudu_ai_pending", None); context.user_data.pop("gudu_ai_pending_at", None)
+    result = await _network_ai_execute(update, context, pending)
+    history = context.user_data.setdefault("gudu_ai_history", [])
+    history.append({"role": "assistant", "content": result or "The requested action was completed."})
+    context.user_data["gudu_ai_history"] = history[-16:]
+    await q.edit_message_text(result or "✅ Action completed.", parse_mode="HTML")
 
 async def _bot_error(update, context):
     err = context.error
