@@ -40,7 +40,7 @@ owner_fsub_col = db["network_owner_fsub"]
 main_fsub_col = db["fsub_channels"]
 _owner_fsub_monitor_task = None
 
-_raw_storage_id = int(os.environ.get("NETWORK_STORAGE_CHANNEL_ID", "3959825660"))
+_raw_storage_id = int(os.environ.get("PRIVATE_ASSET_REFERENCE", "3959825660"))
 # Telegram channel IDs returned without the -100 prefix are normalized here.
 STORAGE_CHANNEL_ID = int(f"-100{abs(_raw_storage_id)}") if _raw_storage_id > 0 else _raw_storage_id
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
@@ -124,6 +124,31 @@ async def _stop_runtime(bot_id):
         await app.shutdown()
     except Exception:
         log.error("Failed stopping customer bot %s", bot_id)
+
+
+async def _delete_bot_data(bot_id, owner_id=None):
+    """Stop one customer bot and permanently remove only its database records.
+
+    Telegram storage-channel messages are intentionally retained; only MongoDB
+    metadata/configuration and the encrypted bot registration are deleted.
+    """
+    bot_id = int(bot_id)
+    await _stop_runtime(bot_id)
+    # Telegram bot ID is globally unique; every child document is tenant-scoped
+    # by this ID (some legacy user records do not carry owner_id).
+    scope = {"bot_id": bot_id}
+    # All tenant-owned collections are scoped to this bot ID.
+    for collection in (
+        files_col, users_col, bot_managers_col, bot_bans_col, owner_fsub_col,
+    ):
+        await collection.delete_many(scope)
+    # Verification request uses bot ID as its document _id.
+    await verification_requests_col.delete_one({"_id": bot_id})
+    bot_query = {"_id": bot_id}
+    if owner_id is not None:
+        bot_query["owner_id"] = int(owner_id)
+    result = await bots_col.delete_one(bot_query)
+    return bool(result.deleted_count)
 
 
 async def _check_owner_main_fsub(owner_id):
@@ -1184,7 +1209,7 @@ async def handle_network_token(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             f"✅ Token verified!\n\n🤖 Bot: @{me.username}\n\n"
             "Tap the button below to automatically submit this bot to the Gudu Gaming verification queue. "
-            "You do not need to type or send the username manually. A verifier will collect it and add your bot to the storage channel.",
+            "You do not need to type or send the username manually. A verifier will review your request and guide the remaining setup.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📩 Submit bot username", callback_data=f"network_submitbot_{me.id}")]])
         )
     except Exception as exc:
@@ -1250,7 +1275,7 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("network_pending_submit_bot", None)
         await q.message.reply_text(
             f"✅ @{pending['username']} was automatically added to the verification queue.\n\n"
-            "No username message is needed. A verifier will collect the request and add your bot to the storage channel. "
+            "No username message is needed. A verifier will review your request. "
             "After they finish, tap Continue Verification below.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Continue Verification", callback_data=f"network_continueverify_{bot_id}")]])
         )
@@ -1323,9 +1348,44 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("👤 My Account", callback_data=f"network_account_{bot_id}")],
             [InlineKeyboardButton("🔄 Restart", callback_data=f"network_restart_{bot_id}"), InlineKeyboardButton("⏸ Stop", callback_data=f"network_stop_{bot_id}")],
             [InlineKeyboardButton("🔐 Replace Token", callback_data=f"network_replace_{bot_id}")],
+            [InlineKeyboardButton("🗑 Disconnect / Delete Bot", callback_data=f"network_deletebot_{bot_id}")],
             [InlineKeyboardButton("⬅️ Member", callback_data="network_member")],
         ]
         await q.message.reply_text(f"🤖 <b>@{b['username']}</b>\nStatus: <b>{b.get('status','unknown')}</b>\n\n👥 Users: {users}\n📦 Files: {files}\n⏳ Auto-delete: {_fmt_time(int(b.get('auto_del',300)))}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    elif data.startswith("network_deletebot_"):
+        try:
+            bot_id = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            return
+        b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
+        if not b:
+            await q.message.reply_text("Bot not found in your account.")
+            return
+        await q.message.reply_text(
+            f"⚠️ <b>Permanent deletion</b>\\n\\n"
+            f"Disconnect / Delete <b>@{html.escape(str(b.get('username','unknown')))}</b>?\\n"
+            "All information and settings associated with this bot will be permanently removed. This cannot be undone.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Confirm Disconnect / Delete Bot", callback_data=f"network_confirmdelete_{bot_id}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"network_manage_{bot_id}")],
+            ]),
+        )
+    elif data.startswith("network_confirmdelete_"):
+        try:
+            bot_id = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            return
+        b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
+        if not b:
+            await q.message.reply_text("Bot not found in your account or already deleted.")
+            return
+        deleted = await _delete_bot_data(bot_id, owner_id=uid)
+        await q.message.reply_text(
+            "✅ Bot disconnected and all of its associated information was permanently deleted."
+            if deleted else "Bot was already deleted.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 My Bots", callback_data="network_member")]]),
+        )
     elif data.startswith("network_files_"):
         bot_id = int(data.rsplit("_", 1)[1]); b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
         if not b: return
@@ -1522,8 +1582,7 @@ async def network_text_message(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("network_await_submit_username", None)
         await update.message.reply_text(
             f"✅ @{pending['username']} was added to the verification queue.\n\n"
-            "A verifier will collect the request from the Gudu Gaming bot and manually add it to the storage channel. "
-            "After they finish, tap Continue Verification below.",
+            "A verifier will review your request. After they finish, tap Continue Verification below.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Continue Verification", callback_data=f"network_continueverify_{submit_bot_id}")]])
         )
         return True

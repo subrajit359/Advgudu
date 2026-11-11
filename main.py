@@ -842,8 +842,13 @@ async def _is_manager(uid):
 
 ADMIN_GG_PERMISSIONS = {
     "upload_files": "Upload files",
+    "manage_files": "Manage / delete files",
     "view_stats": "View statistics",
     "manage_autodel": "Change auto-delete",
+    "manage_fsub": "Manage Force Subscribe",
+    "broadcast": "Send broadcasts",
+    "manage_users": "Ban / unban users",
+    "edit_messages": "Edit bot messages",
 }
 
 async def _manager_has_permission(uid, permission):
@@ -860,10 +865,45 @@ async def _can_upload(uid):
     return await _manager_has_permission(uid, "upload_files")
 
 
+async def _require_admin_permission(update, permission):
+    user = update.effective_user
+    if not user:
+        return False
+    allowed = await _manager_has_permission(user.id, permission)
+    if not allowed and update.effective_message:
+        await update.effective_message.reply_text("⛔ You do not have permission for this action.")
+    return allowed
+
+
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user:
         return
-    if not _is_admin(update.effective_user.id):
+    is_owner = _is_admin(update.effective_user.id)
+    is_manager = await _is_manager(update.effective_user.id)
+    if not (is_owner or is_manager):
+        return
+    if is_manager and not is_owner:
+        rows = []
+        for permission, label, callback in [
+            ("view_stats", "📊 Overview & Stats", "adm_stats"),
+            ("manage_files", "📦 Manage / Delete Files", "adm_listfiles"),
+            ("manage_fsub", "🔒 Force Subscribe", "adm_listfsub"),
+            ("manage_fsub", "➕ Add Force Subscribe", "adm_addfsub_help"),
+            ("manage_fsub", "➖ Remove Force Subscribe", "adm_removefsub_help"),
+            ("manage_autodel", "⏳ Auto Delete", "adm_autodel_help"),
+            ("broadcast", "📡 Broadcast", "adm_broadcast_help"),
+            ("manage_users", "🚫 Ban / Unban Users", "adm_ban_help"),
+            ("edit_messages", "📝 Edit Messages", "adm_listmsgs"),
+        ]:
+            if await _manager_has_permission(update.effective_user.id, permission):
+                rows.append([InlineKeyboardButton(label, callback_data=callback)])
+        rows.append([InlineKeyboardButton("🏠 User Menu", callback_data="user_home")])
+        markup = InlineKeyboardMarkup(rows)
+        text = "🛠 <b>AdminGG Manager Dashboard</b>\\n\\nOpen only the sections granted by the Admin."
+        if update.callback_query:
+            await _edit_callback_message(update.callback_query, text, markup)
+        else:
+            await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
         return
     auto_del = await db_get_auto_del()
     fsub = await db_get_fsub()
@@ -900,7 +940,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🚫 Ban", callback_data="adm_ban_help"),
          InlineKeyboardButton("✅ Unban", callback_data="adm_unban_help")],
         [InlineKeyboardButton("🗑 Delete File", callback_data="adm_delfile_help"),
-         InlineKeyboardButton("🍃 Database", callback_data="adm_mongo")],
+         InlineKeyboardButton("🩺 System Status", callback_data="adm_mongo")],
         [InlineKeyboardButton("🏠 User Menu", callback_data="user_home")],
     ]
     markup = InlineKeyboardMarkup(btns)
@@ -914,10 +954,35 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.from_user:
         return
-    await q.answer()
-    if not _is_admin(q.from_user.id):
-        return
+    is_owner = _is_admin(q.from_user.id)
     d = q.data
+    if not is_owner:
+        if not await _is_manager(q.from_user.id):
+            await q.answer()
+            return
+        callback_permissions = [
+            (("adm_stats",), "view_stats"),
+            (("adm_listfiles", "adm_fileinfo_", "adm_qdel_"), "manage_files"),
+            (("adm_listfsub", "adm_addfsub_help", "adm_removefsub_help"), "manage_fsub"),
+            (("adm_autodel_help",), "manage_autodel"),
+            (("adm_broadcast_help",), "broadcast"),
+            (("adm_ban_help", "adm_unban_help"), "manage_users"),
+            (("adm_listmsgs",), "edit_messages"),
+        ]
+        if d == "adm_back":
+            await q.answer()
+            await admin_panel(update, context)
+            return
+        allowed = any(
+            d.startswith(prefix)
+            and await _manager_has_permission(q.from_user.id, permission)
+            for prefixes, permission in callback_permissions
+            for prefix in prefixes
+        )
+        if not allowed:
+            await q.answer("You do not have permission for this section.", show_alert=True)
+            return
+    await q.answer()
 
     if d == "adm_bot_verifiers":
         verifier_doc = await _db["network_settings"].find_one({"_id": "bot_verifiers"}) or {}
@@ -998,8 +1063,55 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Runtime: <b>{'Running' if bot_id in __import__('network')._running else 'Not running'}</b>")
         rows = [[InlineKeyboardButton("▶️ Start", callback_data=f"adm_botstart_{bot_id}"), InlineKeyboardButton("⏸ Stop", callback_data=f"adm_botstop_{bot_id}")],
                 [InlineKeyboardButton("🔄 Restart", callback_data=f"adm_botrestart_{bot_id}")],
+                [InlineKeyboardButton("🗑 Disconnect / Delete Bot", callback_data=f"adm_botdelete_{bot_id}")],
                 [InlineKeyboardButton("⬅️ Member", callback_data=f"adm_member_{bot_doc.get('owner_id')}")]]
         await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif d.startswith("adm_botdelete_") and not d.startswith("adm_botdelete_confirm_"):
+        try:
+            bot_id = int(d[len("adm_botdelete_"):])
+        except ValueError:
+            await q.answer("Invalid bot ID.", show_alert=True)
+            return
+        bot_doc = await _db["network_bots"].find_one({"_id": bot_id})
+        if not bot_doc:
+            await q.answer("Bot not found.", show_alert=True)
+            return
+        await _edit_callback_message(
+            q,
+            f"⚠️ <b>Permanent bot deletion</b>\\n\\n"
+            f"Disconnect / Delete <b>@{html.escape(str(bot_doc.get('username','unknown')))}</b>?\\n"
+            "All information and settings associated with this bot will be permanently removed. This cannot be undone.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Confirm Disconnect / Delete Bot", callback_data=f"adm_botdelete_confirm_{bot_id}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data=f"adm_botctl_{bot_id}")],
+            ]),
+        )
+
+    elif d.startswith("adm_botdelete_confirm_"):
+        try:
+            bot_id = int(d[len("adm_botdelete_confirm_"):])
+        except ValueError:
+            await q.answer("Invalid bot ID.", show_alert=True)
+            return
+        bot_doc = await _db["network_bots"].find_one({"_id": bot_id})
+        if not bot_doc:
+            await q.answer("Bot not found or already deleted.", show_alert=True)
+            return
+        try:
+            import network as network_runtime
+            deleted = await network_runtime._delete_bot_data(bot_id)
+            await _edit_callback_message(
+                q,
+                "✅ Bot disconnected and all associated information was permanently deleted."
+                if deleted else "Bot was already deleted.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Network Members", callback_data="adm_network_members")]]),
+            )
+        except Exception:
+            logging.exception("Admin bot deletion failed for bot %s", bot_id)
+            await _edit_callback_message(q, "❌ Deletion failed. Check server logs.", parse_mode="HTML", reply_markup=_back_btn())
 
     elif d.startswith(("adm_botstart_", "adm_botstop_", "adm_botrestart_")):
         import network as network_runtime
@@ -1024,7 +1136,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _db["network_bots"].update_one({"_id": bot_id}, {"$set": {"status": "error"}})
             await q.answer("❌ Operation failed. Check server logs.", show_alert=True)
         fresh = await _db["network_bots"].find_one({"_id": bot_id})
-        await _edit_callback_message(q, f"🤖 <b>@{html.escape(str(fresh.get('username','unknown')))}</b>\nStatus: <b>{html.escape(str(fresh.get('status','unknown')))}</b>\nRuntime: <b>{'Running' if bot_id in network_runtime._running else 'Not running'}</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Start", callback_data=f"adm_botstart_{bot_id}"), InlineKeyboardButton("⏸ Stop", callback_data=f"adm_botstop_{bot_id}")], [InlineKeyboardButton("🔄 Restart", callback_data=f"adm_botrestart_{bot_id}")], [InlineKeyboardButton("⬅️ Member", callback_data=f"adm_member_{fresh.get('owner_id')}")]]))
+        await _edit_callback_message(q, f"🤖 <b>@{html.escape(str(fresh.get('username','unknown')))}</b>\nStatus: <b>{html.escape(str(fresh.get('status','unknown')))}</b>\nRuntime: <b>{'Running' if bot_id in network_runtime._running else 'Not running'}</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Start", callback_data=f"adm_botstart_{bot_id}"), InlineKeyboardButton("⏸ Stop", callback_data=f"adm_botstop_{bot_id}")], [InlineKeyboardButton("🔄 Restart", callback_data=f"adm_botrestart_{bot_id}")], [InlineKeyboardButton("🗑 Disconnect / Delete Bot", callback_data=f"adm_botdelete_{bot_id}")], [InlineKeyboardButton("⬅️ Member", callback_data=f"adm_member_{fresh.get('owner_id')}")]]))
 
     elif d.startswith("adm_member_suspend_") or d.startswith("adm_member_resume_"):
         suspend = d.startswith("adm_member_suspend_")
@@ -1051,7 +1163,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "🛠 <b>AdminGG Manager Management</b>\n\n"
             f"👥 Total managers: <b>{len(managers)}</b>\n\n"
-            "Select a manager below to customize delegated permissions.\n\n"
+            "Select a manager below to customize delegated permissions.\n"
+            "Permissions: upload, file management, stats, auto-delete, Force Subscribe, broadcasts, user moderation and messages.\n\n"
             "➕ Add manager: <code>/addmanager USER_ID</code>\n"
             "➖ Remove manager: use the button below.\n"
             "📋 List managers: <code>/listmanagers</code>"
@@ -1146,15 +1259,15 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             users = await db_user_count()
             files = await db_file_count()
             text = (
-                f"🍃 <b>MongoDB Status</b>\n\n"
+                f"🩺 <b>System Status</b>\n\n"
                 f"✅ <b>Connected</b>\n"
-                f"🗄 DB: <code>{DB_NAME}</code>\n"
+                
                 f"👥 Users: <b>{users}</b>\n"
                 f"📦 Files: <b>{files}</b>\n\n"
-                f"<i>All data persists across deployments</i>"
+                f"<i>Service status and usage overview</i>"
             )
         except Exception as e:
-            text = f"🍃 <b>MongoDB Status</b>\n\n❌ <b>Error:</b>\n<code>{e}</code>"
+            text = "🩺 <b>System Status</b>\n\n❌ Status is temporarily unavailable."
         await _edit_callback_message(q, text, parse_mode="HTML", reply_markup=_back_btn())
 
     elif d == "adm_listfsub":
@@ -1379,8 +1492,8 @@ async def cmd_addmanager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid == OWNER_ID:
         await update.message.reply_text("The owner already has full admin access.")
         return
-    await managers_col.update_one({"_id": uid}, {"$set": {"_id": uid, "added_by": OWNER_ID, "permissions": {"upload_files": True}}}, upsert=True)
-    await update.message.reply_text(f"✅ <code>{uid}</code> added as AdminGG manager. They can upload files and receive share links only.", parse_mode="HTML")
+    await managers_col.update_one({"_id": uid}, {"$set": {"_id": uid, "added_by": OWNER_ID, "permissions": {key: (key == "upload_files") for key in ADMIN_GG_PERMISSIONS}}}, upsert=True)
+    await update.message.reply_text(f"✅ <code>{uid}</code> added as AdminGG manager. Upload permission is enabled by default; configure all other permissions in /admin → Manager Management.", parse_mode="HTML")
 
 
 async def cmd_removemanager(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1407,7 +1520,7 @@ async def cmd_listmanagers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_testfsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Diagnose Force Subscribe channel access and bot admin status (owner only)."""
-    if not update.effective_user or not _is_admin(update.effective_user.id):
+    if not await _require_admin_permission(update, "manage_fsub"):
         return
     channels = await db_get_fsub()
     if not channels:
@@ -1444,7 +1557,7 @@ async def cmd_addfsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Usage: /addfsub -1001234567890 [https://t.me/+invite]
            /addfsub -100111 -100222
     """
-    if not _is_admin(update.effective_user.id):
+    if not await _require_admin_permission(update, "manage_fsub"):
         return
     if not context.args:
         await update.message.reply_text(
@@ -1476,7 +1589,7 @@ async def cmd_addfsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_setfsublink(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set/replace a force-sub channel's join URL manually."""
-    if not _is_admin(update.effective_user.id):
+    if not await _require_admin_permission(update, "manage_fsub"):
         return
     if len(context.args) != 2:
         await update.message.reply_text(
@@ -1503,7 +1616,7 @@ async def cmd_setfsublink(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_removefsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id): return
+    if not await _require_admin_permission(update, "manage_fsub"): return
     if not context.args:
         await update.message.reply_text("Usage: /removefsub <channel_id>")
         return
@@ -1512,7 +1625,7 @@ async def cmd_removefsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_listfsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id): return
+    if not await _require_admin_permission(update, "manage_fsub"): return
     channels = await db_get_fsub()
     if not channels:
         await update.message.reply_text("No force sub channels.")
@@ -1524,7 +1637,7 @@ async def cmd_listfsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id): return
+    if not await _require_admin_permission(update, "view_stats"): return
     text = (
         f"📊 <b>Stats</b>\n\n"
         f"👥 Users: <b>{await db_user_count()}</b>\n"
@@ -1535,22 +1648,22 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 
-async def cmd_mongo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_systemstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update.effective_user.id): return
     try:
         await _client.admin.command("ping")
         users = await db_user_count()
         files = await db_file_count()
         text = (
-            f"🍃 <b>MongoDB Status</b>\n\n"
+            f"🩺 <b>System Status</b>\n\n"
             f"✅ <b>Connected</b>\n"
-            f"🗄 DB: <code>{DB_NAME}</code>\n"
+            
             f"👥 Users: <b>{users}</b>\n"
             f"📦 Files: <b>{files}</b>\n\n"
-            f"<i>Data persists across all deployments</i>"
+            f"<i>Service status and usage overview</i>"
         )
     except Exception as e:
-        text = f"🍃 <b>MongoDB Status</b>\n\n❌ <b>Error:</b>\n<code>{e}</code>"
+        text = "🩺 <b>System Status</b>\n\n❌ Status is temporarily unavailable."
     await update.message.reply_text(text, parse_mode="HTML")
 
 
@@ -1571,7 +1684,7 @@ async def cmd_setautodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id): return
+    if not await _require_admin_permission(update, "edit_messages"): return
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /setmsg <KEY> <text>")
         return
@@ -1584,14 +1697,14 @@ async def cmd_setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_listmsgs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id): return
+    if not await _require_admin_permission(update, "edit_messages"): return
     text = "📝 <b>Message Keys:</b>\n\n" + "\n".join(f"• <code>{k}</code>" for k in DEFAULT_MESSAGES)
     await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Broadcast text or copy a replied-to Telegram message/media to all users."""
-    if not update.effective_user or not _is_admin(update.effective_user.id):
+    if not await _require_admin_permission(update, "broadcast"):
         return
 
     source = update.message.reply_to_message
@@ -1630,7 +1743,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id): return
+    if not await _require_admin_permission(update, "manage_users"): return
     if not context.args:
         await update.message.reply_text("Usage: /ban <user_id>")
         return
@@ -1640,7 +1753,7 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id): return
+    if not await _require_admin_permission(update, "manage_users"): return
     if not context.args:
         await update.message.reply_text("Usage: /unban <user_id>")
         return
@@ -1650,7 +1763,7 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_delfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_user.id): return
+    if not await _require_admin_permission(update, "manage_files"): return
     if not context.args:
         await update.message.reply_text("Usage: /delfile <token>")
         return
@@ -1715,7 +1828,7 @@ def main():
     app.add_handler(CommandHandler("addmanager", cmd_addmanager))
     app.add_handler(CommandHandler("removemanager", cmd_removemanager))
     app.add_handler(CommandHandler("listmanagers", cmd_listmanagers))
-    app.add_handler(CommandHandler("mongo", cmd_mongo))
+    app.add_handler(CommandHandler("systemstatus", cmd_systemstatus))
     app.add_handler(CommandHandler("testfsub", cmd_testfsub))
     app.add_handler(CommandHandler("networkfsubadd", cmd_network_fsub_add))
     app.add_handler(CommandHandler("networkfsubremove", cmd_network_fsub_remove))
