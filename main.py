@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import html
 import re
 import uuid
 import secrets
@@ -556,16 +557,20 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")]])
         await _edit_callback_message(q, text, markup)
     elif q.data == "user_account":
+        await q.answer()
         member_bots = await _db["network_bots"].find({"owner_id": q.from_user.id}).to_list(None)
         bot_ids = [int(b["_id"]) for b in member_bots]
         member_files = await _db["network_files"].count_documents({"bot_id": {"$in": bot_ids}}) if bot_ids else 0
         member_users = await _db["network_users"].count_documents({"bot_id": {"$in": bot_ids}}) if bot_ids else 0
         member_managers = await _db["network_bot_managers"].count_documents({"bot_id": {"$in": bot_ids}}) if bot_ids else 0
-        member_downloads = await _db["network_users"].aggregate([{"$match": {"bot_id": {"$in": bot_ids}}}, {"$group": {"_id": None, "n": {"$sum": "$downloads"}}}]).to_list(1) if bot_ids else []
+        member_downloads = await _db["network_users"].aggregate([{"$match": {"bot_id": {"$in": bot_ids}}}, {"$group": {"_id": None, "n": {"$sum": {"$convert": {
+                "input": {"$ifNull": ["$downloads", 0]}, "to": "long",
+                "onError": 0, "onNull": 0,
+            }}}}}]).to_list(1) if bot_ids else []
         text = (
             "👤 <b>Your Gudu Gaming Account</b>\n\n"
             f"🆔 Telegram ID: <code>{q.from_user.id}</code>\n"
-            f"📛 Name: {q.from_user.first_name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')}\n\n"
+            f"📛 Name: {html.escape(q.from_user.first_name or 'Telegram user')}\n\n"
             f"🤖 Your bots: <b>{len(bot_ids)}</b>\n📦 Files: <b>{member_files}</b>\n"
             f"👥 Users: <b>{member_users}</b>\n📥 Downloads: <b>{member_downloads[0]['n'] if member_downloads else 0}</b>\n"
             f"🛠 Managers: <b>{member_managers}</b>"
@@ -1579,7 +1584,19 @@ async def cmd_delfile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update, context):
     err = context.error
-    logging.error("Update processing failed (%s)", type(err).__name__, exc_info=context.error)
+    if err is None:
+        return
+    logging.error(
+        "Update processing failed (%s)", type(err).__name__,
+        exc_info=(type(err), err, err.__traceback__),
+    )
+    # Give the user a useful response without exposing internal exception details.
+    try:
+        message = update.effective_message if update else None
+        if message:
+            await message.reply_text("❌ Something went wrong while processing that action. Please try again.")
+    except Exception:
+        logging.exception("Could not send the update-error notice to the user")
 
 
 async def post_init(app):

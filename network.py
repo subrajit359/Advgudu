@@ -329,6 +329,14 @@ async def shutdown_network_bots():
         pass
 
 
+async def _is_bot_manager(bot_id, user_id):
+    """Check manager membership for this bot only (never across tenants)."""
+    return await bot_managers_col.find_one({
+        "bot_id": int(bot_id),
+        "user_id": int(user_id),
+    }) is not None
+
+
 async def _bot_privileged_ids(bot_id, owner_id):
     """Return the owner and appointed managers for one customer bot.
 
@@ -344,6 +352,19 @@ async def _bot_privileged_ids(bot_id, owner_id):
         int(item["user_id"]) for item in managers if item.get("user_id") is not None
     )
     return list(privileged_ids)
+
+
+async def _normal_bot_user_filter(bot_id, owner_id):
+    """Return the customer-user query for one bot, excluding its owner/managers.
+
+    Keep the bot ID in the filter so a manager appointed on another customer bot
+    never receives privileges or exclusions outside their assigned bot.
+    """
+    privileged_ids = await _bot_privileged_ids(int(bot_id), int(owner_id))
+    return {
+        "bot_id": int(bot_id),
+        "user_id": {"$nin": privileged_ids},
+    }
 
 
 async def _lookup_bot(context):
@@ -751,7 +772,10 @@ async def cmd_bot_myaccount(update, context):
         users += await users_col.count_documents(normal_filter)
         per_bot_downloads = await users_col.aggregate([
             {"$match": normal_filter},
-            {"$group": {"_id": None, "n": {"$sum": {"$ifNull": ["$downloads", 0]}}}},
+            {"$group": {"_id": None, "n": {"$sum": {"$convert": {
+                "input": {"$ifNull": ["$downloads", 0]}, "to": "long",
+                "onError": 0, "onNull": 0,
+            }}}}},
         ]).to_list(1)
         downloads_total += per_bot_downloads[0]["n"] if per_bot_downloads else 0
     files = await files_col.count_documents({"bot_id": {"$in": bot_ids}, "owner_id": int(doc["owner_id"])}) if bot_ids else 0
@@ -801,7 +825,10 @@ async def _panel_account_text(context, doc):
     managers = await bot_managers_col.count_documents({"bot_id": bot_id})
     agg = await users_col.aggregate([
         {"$match": {"bot_id": bot_id, "user_id": {"$nin": privileged_ids}}},
-        {"$group": {"_id": None, "n": {"$sum": {"$ifNull": ["$downloads", 0]}}}},
+        {"$group": {"_id": None, "n": {"$sum": {"$convert": {
+                "input": {"$ifNull": ["$downloads", 0]}, "to": "long",
+                "onError": 0, "onNull": 0,
+            }}}}},
     ]).to_list(1)
     return (f"📊 <b>Bot Account — @{context.bot.username}</b>\n\n"
             f"📦 Files: <b>{files}</b>\n👥 Users: <b>{users}</b>\n"
@@ -1023,7 +1050,19 @@ async def _bot_panel_broadcast_media(update: Update, context: ContextTypes.DEFAU
 
 
 async def _bot_error(update, context):
-    log.error("Customer bot update failed (%s)", type(context.error).__name__)
+    err = context.error
+    if err is None:
+        return
+    log.error(
+        "Customer bot update failed (%s)", type(err).__name__,
+        exc_info=(type(err), err, err.__traceback__),
+    )
+    try:
+        message = update.effective_message if update else None
+        if message:
+            await message.reply_text("❌ Something went wrong while processing that action. Please try again.")
+    except Exception:
+        log.exception("Could not send the customer-bot error notice to the user")
 
 
 async def handle_network_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1205,6 +1244,7 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✏️ Welcome Text", callback_data=f"network_welcome_{bot_id}"), InlineKeyboardButton("📢 My Channel", callback_data=f"network_channel_{bot_id}")],
             [InlineKeyboardButton("📡 Broadcast", callback_data=f"network_broadcast_{bot_id}")],
             [InlineKeyboardButton("⏳ Auto Delete", callback_data=f"network_autodel_{bot_id}")],
+            [InlineKeyboardButton("👤 My Account", callback_data=f"network_account_{bot_id}")],
             [InlineKeyboardButton("🔄 Restart", callback_data=f"network_restart_{bot_id}"), InlineKeyboardButton("⏸ Stop", callback_data=f"network_stop_{bot_id}")],
             [InlineKeyboardButton("🔐 Replace Token", callback_data=f"network_replace_{bot_id}")],
             [InlineKeyboardButton("⬅️ Member", callback_data="network_member")],
@@ -1234,12 +1274,44 @@ async def network_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.warning("Could not delete storage message for network file %s", token)
         await files_col.delete_one({"_id": token, "bot_id": bot_id, "owner_id": uid})
         await q.message.reply_text("✅ File deleted.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📁 Back to Files", callback_data=f"network_files_{bot_id}")], [InlineKeyboardButton("⬅️ Bot Controls", callback_data=f"network_manage_{bot_id}")]]))
+    elif data.startswith("network_account_"):
+        # Account details are scoped to the selected bot and its verified owner.
+        try:
+            bot_id = int(data.rsplit("_", 1)[1])
+        except (TypeError, ValueError):
+            await q.message.reply_text("Invalid bot selection. Please reopen Member Control Center.")
+            return
+        b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
+        if not b:
+            await q.message.reply_text("Bot not found in your account.")
+            return
+        privileged_ids = await _bot_privileged_ids(bot_id, b["owner_id"])
+        user_filter = {"bot_id": bot_id, "user_id": {"$nin": privileged_ids}}
+        users = await users_col.count_documents(user_filter)
+        files = await files_col.count_documents({"bot_id": bot_id, "owner_id": uid})
+        managers = await bot_managers_col.count_documents({"bot_id": bot_id})
+        totals = await users_col.aggregate([
+            {"$match": user_filter},
+            {"$group": {"_id": None, "n": {"$sum": {"$convert": {
+                "input": {"$ifNull": ["$downloads", 0]}, "to": "long",
+                "onError": 0, "onNull": 0,
+            }}}}},
+        ]).to_list(1)
+        downloads = totals[0].get("n", 0) if totals else 0
+        await q.message.reply_text(
+            f"👤 <b>My Account — @{html.escape(str(b.get('username') or 'bot'))}</b>\n\n"
+            f"🤖 Bots: <b>1</b>\n📦 Files: <b>{files}</b>\n"
+            f"👥 Users: <b>{users}</b>\n📥 Downloads: <b>{downloads}</b>\n"
+            f"🛠 Managers: <b>{managers}</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"network_manage_{bot_id}")]]),
+        )
     elif data.startswith("network_stats_"):
         bot_id = int(data.rsplit("_", 1)[1]); b = await bots_col.find_one({"_id": bot_id, "owner_id": uid})
         if not b: return
         privileged_ids = await _bot_privileged_ids(bot_id, b["owner_id"])
         users = await users_col.count_documents({"bot_id": bot_id, "user_id": {"$nin": privileged_ids}}); files = await files_col.count_documents({"bot_id": bot_id, "owner_id": uid})
-        downloads = await users_col.aggregate([{"$match":{"bot_id":bot_id,"user_id":{"$nin":privileged_ids}}},{"$group":{"_id":None,"n":{"$sum":"$downloads"}}}]).to_list(1)
+        downloads = await users_col.aggregate([{"$match":{"bot_id":bot_id,"user_id":{"$nin":privileged_ids}}},{"$group":{"_id":None,"n":{"$sum":{"$convert":{"input":{"$ifNull":["$downloads",0]},"to":"long","onError":0,"onNull":0}}}}}]).to_list(1)
         await q.message.reply_text(f"📊 @{b['username']}\n👥 Users: {users}\n📦 Files: {files}\n📥 Downloads: {downloads[0]['n'] if downloads else 0}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"network_manage_{bot_id}")]]))
     elif data.startswith("network_addfsub_"):
         bot_id = int(data.rsplit("_",1)[1]); b = await bots_col.find_one({"_id":bot_id,"owner_id":uid})
@@ -1475,7 +1547,10 @@ async def _bot_account_callback(update: Update, context: ContextTypes.DEFAULT_TY
         users += await users_col.count_documents(normal_filter)
         per_bot_downloads = await users_col.aggregate([
             {"$match": normal_filter},
-            {"$group": {"_id": None, "n": {"$sum": {"$ifNull": ["$downloads", 0]}}}},
+            {"$group": {"_id": None, "n": {"$sum": {"$convert": {
+                "input": {"$ifNull": ["$downloads", 0]}, "to": "long",
+                "onError": 0, "onNull": 0,
+            }}}}},
         ]).to_list(1)
         downloads_total += per_bot_downloads[0]["n"] if per_bot_downloads else 0
     files = await files_col.count_documents({"bot_id": {"$in": bot_ids}, "owner_id": int(doc["owner_id"])}) if bot_ids else 0

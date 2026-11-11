@@ -48,3 +48,13 @@ Operational check: run `/listfsubmem` in the main Gudu Gaming bot and confirm th
 - `python -m py_compile main.py network.py` — passed after this update.
 
 Live Telegram/MongoDB tests are still required; static checks do not prove runtime delivery or API permissions.
+
+## Account panel and missing-helper regression checks (2026-11-11)
+
+- Restored missing `_is_bot_manager()` and `_normal_bot_user_filter()` helpers after verifying their call sites. Both enforce bot-specific manager scope.
+- Added and statically verified the selected-bot `network_account_<bot_id>` callback and its owner-scoped database filters.
+- Verified the customer-bot `netaccount` and `netpanel:account` registrations, plus main-bot `user_account` and `network_` routing.
+- Verified callback acknowledgement in the main `user_account` branch and traceback-preserving error logging in both applications.
+- `python -m compileall -q` and AST compilation passed for all Python source files.
+- Mock async tests passed for manager lookup, cross-bot isolation, and owner/manager exclusion.
+- Live Telegram and MongoDB integration tests were not run because the local environment does not contain `python-telegram-bot`, `motor`, or `pymongo`, and no production credentials were provided.

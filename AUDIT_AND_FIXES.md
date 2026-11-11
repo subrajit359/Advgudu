@@ -36,3 +36,21 @@ This is static/local validation. No live Telegram API, BotFather token, Railway 
 - The helper returns the bot owner plus managers assigned to that specific bot, using `bot_managers_col`.
 - Existing callers remain unchanged, preserving user exclusion from statistics/broadcasts and owner/manager ban protection.
 - Python compilation passed for every `.py` file in the delivered project. Live Telegram/MongoDB behavior still requires staging verification.
+
+## Account and member-control repair (2026-11-11)
+
+- Restored `_is_bot_manager(bot_id, user_id)`, which was called by the customer-bot Control Center but missing from the supplied source. Its lookup is scoped to both bot ID and Telegram user ID.
+- Restored `_normal_bot_user_filter(bot_id, owner_id)`, which was called by both customer-bot account workflows but missing from the supplied source. It excludes the owner and only managers assigned to that specific bot.
+- Added a per-bot **My Account** entry to the main bot's Member Bot management screen. Its callback verifies `owner_id` and scopes files, users, downloads, and managers to the selected bot.
+- Hardened account/download aggregation to treat null, invalid, and non-numeric `downloads` values as zero rather than allowing malformed legacy values to break the account panel.
+- Added the missing callback acknowledgement to the main bot's `user_account` path and escaped the displayed Telegram first name for HTML mode.
+- Updated both main-bot and customer-bot error handlers to log the original exception traceback and send a generic user-facing failure notice without exposing internals.
+- Kept `_bot_privileged_ids` and all existing call sites; its owner/manager security semantics were not bypassed.
+
+## Validation performed for this repair
+
+- `python -m compileall -q` passed for all supplied Python source files (`main.py`, `network.py`, `config.py`).
+- Python AST parsing and compilation passed for each source file.
+- Static regression assertions passed for the three manager/privilege/account helper definitions, all account callback registrations/routes, the new Member Bot My Account route, and traceback logging.
+- Mock async tests passed for bot-specific manager lookup and owner/manager exclusion from normal-user filters, including cross-bot isolation.
+- The runtime dependencies `python-telegram-bot`, `motor`, and `pymongo` are not installed in the local validation environment. Therefore live imports, Telegram callback execution, and MongoDB aggregation execution were not tested here. Live staging verification remains required.
