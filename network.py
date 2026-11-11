@@ -329,6 +329,23 @@ async def shutdown_network_bots():
         pass
 
 
+async def _bot_privileged_ids(bot_id, owner_id):
+    """Return the owner and appointed managers for one customer bot.
+
+    These IDs are excluded from customer statistics/broadcasts and protected
+    from being banned. The query is scoped to bot_id so managers of one bot
+    do not receive privileges in another bot.
+    """
+    privileged_ids = {int(owner_id)}
+    managers = await bot_managers_col.find(
+        {"bot_id": int(bot_id)}, {"user_id": 1, "_id": 0}
+    ).to_list(None)
+    privileged_ids.update(
+        int(item["user_id"]) for item in managers if item.get("user_id") is not None
+    )
+    return list(privileged_ids)
+
+
 async def _lookup_bot(context):
     return await bots_col.find_one({"_id": int(context.bot.id)})
 

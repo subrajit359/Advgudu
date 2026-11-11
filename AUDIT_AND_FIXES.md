@@ -28,3 +28,11 @@ This is static/local validation. No live Telegram API, BotFather token, Railway 
 - Broadcast loops are sequential and have no resumable job state; large bot audiences can take time and may be interrupted by deployment restarts.
 - `_check_membership` checks both global and bot-specific channels through the main bot client; ensure the main bot remains an administrator in every configured channel.
 - The current manual verification queue requires a verifier to add a member bot to storage before it becomes active; that operational dependency should be documented and monitored.
+
+
+## Runtime NameError fix (2026-11-11)
+
+- Restored the missing `_bot_privileged_ids(bot_id, owner_id)` helper in `network.py`.
+- The helper returns the bot owner plus managers assigned to that specific bot, using `bot_managers_col`.
+- Existing callers remain unchanged, preserving user exclusion from statistics/broadcasts and owner/manager ban protection.
+- Python compilation passed for every `.py` file in the delivered project. Live Telegram/MongoDB behavior still requires staging verification.
